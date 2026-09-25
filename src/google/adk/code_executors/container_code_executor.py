@@ -14,15 +14,17 @@
 
 from __future__ import annotations
 
-import atexit
 import logging
 import os
-from typing import Optional
+from typing import Any
+from typing import cast
+import weakref
 
 import docker
 from docker.client import DockerClient
 from docker.models.containers import Container
 from pydantic import Field
+from pydantic import PrivateAttr
 from typing_extensions import override
 
 from ..agents.invocation_context import InvocationContext
@@ -102,6 +104,25 @@ else:
 """ % _TIMEOUT_EXIT_CODE
 
 
+def _cleanup_container(container: Container | None) -> bool:
+  """Stops and removes the container."""
+  if not container:
+    return True
+
+  try:
+    container.stop()
+    container.remove()
+    logger.info('Container %s stopped and removed.', container.id)
+    return True
+  except Exception as e:
+    try:
+      logger.warning('Failed to cleanup container: %s', e)
+    except Exception:
+      pass
+    e.__traceback__ = None
+    return False
+
+
 class ContainerCodeExecutor(BaseCodeExecutor):
   """A code executor that uses a custom container to execute code.
 
@@ -126,18 +147,18 @@ class ContainerCodeExecutor(BaseCodeExecutor):
       requests and you trust it.
   """
 
-  base_url: Optional[str] = None
+  base_url: str | None = None
   """
   Optional. The base url of the user hosted Docker client.
   """
 
-  image: str = None
+  image: str = DEFAULT_IMAGE_TAG
   """
   The tag of the predefined image or custom image to run on the container.
   Either docker_path or image must be set.
   """
 
-  docker_path: str = None
+  docker_path: str | None = None
   """
   The path to the directory containing the Dockerfile.
   If set, build the image from the dockerfile path instead of using the
@@ -179,16 +200,17 @@ class ContainerCodeExecutor(BaseCodeExecutor):
   # optimize_data_file.
   optimize_data_file: bool = Field(default=False, frozen=True, exclude=True)
 
-  _client: DockerClient = None
-  _container: Container = None
+  _client: DockerClient | None = PrivateAttr(default=None)
+  _container: Container | None = PrivateAttr(default=None)
+  _finalizer: weakref.finalize | None = PrivateAttr(default=None)
 
   def __init__(
       self,
-      base_url: Optional[str] = None,
-      image: Optional[str] = None,
-      docker_path: Optional[str] = None,
-      **data,
-  ):
+      base_url: str | None = None,
+      image: str | None = None,
+      docker_path: str | None = None,
+      **data: Any,
+  ) -> None:
     """Initializes the ContainerCodeExecutor.
 
     Args:
@@ -224,9 +246,6 @@ class ContainerCodeExecutor(BaseCodeExecutor):
     # Initialize the container.
     self.__init_container()
 
-    # Close the container when the on exit.
-    atexit.register(self.__cleanup_container)
-
   @override
   def execute_code(
       self,
@@ -235,7 +254,7 @@ class ContainerCodeExecutor(BaseCodeExecutor):
   ) -> CodeExecutionResult:
     output = ''
     error = ''
-    exec_result = self._container.exec_run(
+    exec_result = cast(Container, self._container).exec_run(
         [
             'python3',
             '-c',
@@ -270,9 +289,10 @@ class ContainerCodeExecutor(BaseCodeExecutor):
         stdout=output,
         stderr=error,
         output_files=[],
+        exit_code=exec_result.exit_code,
     )
 
-  def _build_docker_image(self):
+  def _build_docker_image(self) -> None:
     """Builds the Docker image."""
     if not self.docker_path:
       raise ValueError('Docker path is not set.')
@@ -280,20 +300,22 @@ class ContainerCodeExecutor(BaseCodeExecutor):
       raise FileNotFoundError(f'Invalid Docker path: {self.docker_path}')
 
     logger.info('Building Docker image...')
-    self._client.images.build(
+    cast(DockerClient, self._client).images.build(
         path=self.docker_path,
         tag=self.image,
         rm=True,
     )
     logger.info('Docker image: %s built.', self.image)
 
-  def _verify_python_installation(self):
+  def _verify_python_installation(self) -> None:
     """Verifies the container has python3 installed."""
-    exec_result = self._container.exec_run(['which', 'python3'])
+    exec_result = cast(Container, self._container).exec_run(
+        ['which', 'python3']
+    )
     if exec_result.exit_code != 0:
       raise ValueError('python3 is not installed in the container.')
 
-  def __init_container(self):
+  def __init_container(self) -> None:
     """Initializes the container."""
     if not self._client:
       raise RuntimeError('Docker client is not initialized.')
@@ -314,17 +336,28 @@ class ContainerCodeExecutor(BaseCodeExecutor):
         cap_drop=['ALL'],
         security_opt=['no-new-privileges'],
     )
+    self._finalizer = weakref.finalize(
+        self, _cleanup_container, self._container
+    )
     logger.info('Container %s started.', self._container.id)
 
     # Verify the container is able to run python3.
     self._verify_python_installation()
 
-  def __cleanup_container(self):
-    """Closes the container on exit."""
-    if not self._container:
+  def close(self) -> None:
+    """Stops and removes the container."""
+    container = getattr(self, '_container', None)
+    if not container:
       return
 
-    logger.info('[Cleanup] Stopping the container...')
-    self._container.stop()
-    self._container.remove()
-    logger.info('Container %s stopped and removed.', self._container.id)
+    if _cleanup_container(container):
+      self._container = None
+      finalizer = getattr(self, '_finalizer', None)
+      if finalizer:
+        finalizer.detach()
+
+  def __enter__(self) -> ContainerCodeExecutor:
+    return self
+
+  def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    self.close()

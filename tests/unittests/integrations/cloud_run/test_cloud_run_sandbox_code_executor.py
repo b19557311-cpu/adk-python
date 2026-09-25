@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import signal
 import sys
+import time
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -20,6 +22,7 @@ from google.adk.agents.base_agent import BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.code_executors.code_execution_utils import CodeExecutionInput
 from google.adk.code_executors.code_execution_utils import CodeExecutionResult
+from google.adk.integrations.cloud_run import _cloud_run_sandbox_code_executor
 from google.adk.integrations.cloud_run import CloudRunSandboxCodeExecutor
 from google.adk.sessions.base_session_service import BaseSessionService
 from google.adk.sessions.session import Session
@@ -48,6 +51,14 @@ class TestCloudRunSandboxCodeExecutor:
     assert not executor.optimize_data_file
     assert executor.sandbox_bin == "/usr/local/gcp/bin/sandbox"
     assert not executor.allow_egress
+    # Bounded by default, so generated code that never terminates cannot hang
+    # the agent waiting on it.
+    assert executor.timeout_seconds == 300
+
+  def test_init_accepts_timeout_seconds_none(self):
+    """Asking for no timeout at all is still allowed, as on the base class."""
+    executor = CloudRunSandboxCodeExecutor(timeout_seconds=None)
+    assert executor.timeout_seconds is None
 
   def test_init_stateful_raises_error(self):
     with pytest.raises(
@@ -85,6 +96,7 @@ class TestCloudRunSandboxCodeExecutor:
     assert result.stdout == "hello world\n"
     assert result.stderr == ""
     assert result.output_files == []
+    assert result.exit_code == 0
 
     # Verify subprocess.run was called with correct arguments
     expected_python = sys.executable or "python3"
@@ -93,7 +105,7 @@ class TestCloudRunSandboxCodeExecutor:
         input='print("hello world")',
         capture_output=True,
         text=True,
-        timeout=None,
+        timeout=300,
         check=False,
     )
 
@@ -143,6 +155,7 @@ class TestCloudRunSandboxCodeExecutor:
 
     assert result.stdout == ""
     assert "ValueError: Test error" in result.stderr
+    assert result.exit_code == 1
 
   @patch("subprocess.run")
   def test_execute_code_timeout(
@@ -163,6 +176,34 @@ class TestCloudRunSandboxCodeExecutor:
 
     assert result.stdout == "partial stdout"
     assert result.stderr == "partial stderr"
+    assert (
+        result.exit_code == _cloud_run_sandbox_code_executor._TIMEOUT_EXIT_CODE
+    )
+
+  @pytest.mark.skipif(
+      sys.platform == "win32", reason="the sandbox binary is POSIX-only"
+  )
+  def test_explicit_timeout_beats_the_default(
+      self, tmp_path, mock_invocation_context: InvocationContext
+  ):
+    """A shorter timeout is enforced against a sandbox that never finishes."""
+    fake_sandbox = tmp_path / "sandbox"
+    fake_sandbox.write_text("#!/bin/sh\nsleep 120\n")
+    fake_sandbox.chmod(0o755)
+
+    executor = CloudRunSandboxCodeExecutor(
+        sandbox_bin=str(fake_sandbox), timeout_seconds=1
+    )
+    started = time.monotonic()
+    result = executor.execute_code(
+        mock_invocation_context, CodeExecutionInput(code="while True: pass")
+    )
+    elapsed = time.monotonic() - started
+
+    # Well under both the 120s sandbox and the 300s default.
+    assert elapsed < 30
+    assert "timed out after 1 seconds" in result.stderr
+    assert result.exit_code == -signal.SIGKILL
 
   @patch("subprocess.run")
   def test_execute_code_binary_not_found(
@@ -180,3 +221,18 @@ class TestCloudRunSandboxCodeExecutor:
     assert (
         'Sandbox binary "/usr/local/gcp/bin/sandbox" not found' in result.stderr
     )
+    assert result.exit_code is None
+
+  @patch("subprocess.run")
+  def test_execute_code_unexpected_error(
+      self, mock_run, mock_invocation_context: InvocationContext
+  ):
+    mock_run.side_effect = OSError("sandbox is unavailable")
+
+    executor = CloudRunSandboxCodeExecutor()
+    code_input = CodeExecutionInput(code='print("hello")')
+    result = executor.execute_code(mock_invocation_context, code_input)
+
+    assert result.stdout == ""
+    assert "sandbox is unavailable" in result.stderr
+    assert result.exit_code is None

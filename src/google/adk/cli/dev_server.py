@@ -16,7 +16,7 @@
 
 This module provides the DevServer class which extends ApiServer with development-only endpoints.
 All production endpoints are inherited from ApiServer.
-All dev-only endpoints (eval, debug, graph, test management) are added by DevServer.
+All dev-only endpoints (eval, debug, graph, test management, deploy) are added by DevServer.
 
 Use this for local development with `adk web`.
 For production deployments, use api_server.py instead.
@@ -31,15 +31,21 @@ network, and never use it for a production or multi-user deployment.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 import json
 import logging
 import os
 from pathlib import Path
 import shutil
+import signal
+import subprocess
+import sys
 import time
 from typing import Any
+from typing import Iterator
 from typing import Optional
 
+import anyio
 from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi import Request as FastAPIRequest
@@ -72,6 +78,7 @@ from ..evaluation.eval_result import EvalSetResult
 from ..evaluation.eval_set import EvalSet
 from ..utils._telemetry_config import read_telemetry_consent
 from ..utils._telemetry_config import write_telemetry_consent
+from ._dev_deploy import register_dev_deploy_endpoints
 from .api_server import ApiServer
 
 NESTED_APP_SEPARATOR = "."
@@ -84,6 +91,10 @@ from .utils.state import create_empty_state
 logger = logging.getLogger("google_adk." + __name__)
 
 _EVAL_SET_FILE_EXTENSION = ".evalset.json"
+_PROCESS_TERMINATION_GRACE_SECONDS = 0.5
+_PROCESS_TERMINATOR_TIMEOUT_SECONDS = 1.0
+_TEST_OUTPUT_CHUNK_BYTES = 64 * 1024
+_IS_WINDOWS = os.name == "nt"
 
 TAG_DEBUG = "Debug"
 TAG_EVALUATION = "Evaluation"
@@ -187,6 +198,223 @@ class TelemetryConsentRequest(common.BaseModel):
   telemetry: bool
 
 
+# Agent config fields whose value names Python code that the agent loader
+# imports and calls.
+_CODE_REFERENCE_KEYS = frozenset({
+    "after_agent_callbacks",
+    "after_model_callbacks",
+    "after_tool_callbacks",
+    "agent_class",
+    "before_agent_callbacks",
+    "before_model_callbacks",
+    "before_tool_callbacks",
+    "code",
+    "input_schema",
+    "model_code",
+    "output_schema",
+    "tools",
+})
+
+# The namespaces the agent loader searches when a reference has no dots.
+_ADK_BUILT_IN_NAMESPACES = ("google.adk.agents.", "google.adk.tools.")
+
+
+def _iter_code_references(value: Any) -> Iterator[str]:
+  """Yields the names a code-reference field carries, whatever its shape."""
+  if isinstance(value, str):
+    yield value
+  elif isinstance(value, list):
+    for item in value:
+      yield from _iter_code_references(item)
+  elif isinstance(value, dict):
+    name = value.get("name")
+    if isinstance(name, str):
+      yield name
+
+
+def _is_adk_built_in(reference: str) -> bool:
+  """Whether a qualified name reaches what an undotted name would reach.
+
+  One segment after the namespace is a name that namespace exports. A deeper
+  path walks into a submodule and can reach code an undotted reference cannot,
+  so it does not count as a built-in.
+
+  Args:
+    reference: A dotted Python name.
+
+  Returns:
+    Whether the reference names an ADK built-in.
+  """
+  for namespace in _ADK_BUILT_IN_NAMESPACES:
+    if reference.startswith(namespace):
+      return "." not in reference[len(namespace) :]
+  return False
+
+
+def _app_name_shadows_module(app_name: str) -> bool:
+  """Whether the app name collides with a module that can be imported."""
+  # "google" is a namespace package rather than a standard library module, so
+  # it has to be named explicitly.
+  return (
+      app_name in sys.builtin_module_names
+      or app_name in sys.stdlib_module_names
+      or app_name == "google"
+  )
+
+
+def _check_code_reference(
+    reference: str, *, app_name: str, filename: str, field_name: str
+) -> None:
+  """Checks that a code reference stays inside the app being edited.
+
+  Args:
+    reference: The name found in the uploaded document.
+    app_name: The app the document belongs to.
+    filename: The uploaded path, used in the error message.
+    field_name: The config field the reference came from.
+
+  Raises:
+    ValueError: If the reference can reach code outside the app.
+  """
+  if "." not in reference:
+    # The loader resolves an undotted name against ADK's own built-ins.
+    return
+  if _is_adk_built_in(reference):
+    return
+  if not reference.startswith(f"{app_name}."):
+    raise ValueError(
+        f"Blocked code reference {reference!r} in {filename!r}. The"
+        f" '{field_name}' field may only reference code under"
+        f" '{app_name}' or an ADK built-in."
+    )
+  if _app_name_shadows_module(app_name):
+    raise ValueError(
+        f"Blocked code reference {reference!r} in {filename!r}. The app name"
+        f" {app_name!r} shadows an importable Python module, so a reference to"
+        " the app cannot be told apart from one that leaves it."
+    )
+
+
+async def _signal_process_tree(
+    process: asyncio.subprocess.Process,
+    *,
+    force: bool,
+) -> None:
+  """Requests termination of a subprocess and its descendants."""
+  if _IS_WINDOWS:
+    command = ["taskkill", "/PID", str(process.pid), "/T"]
+    if force:
+      command.append("/F")
+    try:
+      terminator = await asyncio.create_subprocess_exec(
+          *command,
+          stdout=asyncio.subprocess.DEVNULL,
+          stderr=asyncio.subprocess.DEVNULL,
+      )
+      try:
+        await asyncio.wait_for(
+            terminator.wait(), timeout=_PROCESS_TERMINATOR_TIMEOUT_SECONDS
+        )
+      except asyncio.TimeoutError:
+        terminator.kill()
+        try:
+          await asyncio.wait_for(
+              terminator.wait(), timeout=_PROCESS_TERMINATION_GRACE_SECONDS
+          )
+        except asyncio.TimeoutError:
+          logger.warning("taskkill did not exit for process %d", process.pid)
+    except OSError:
+      logger.warning("Unable to run taskkill for process %d", process.pid)
+      if force and process.returncode is None:
+        process.kill()
+    return
+
+  kill_process_group = getattr(os, "killpg", None)
+  if kill_process_group is not None:
+    try:
+      kill_process_group(
+          process.pid,
+          (
+              getattr(signal, "SIGKILL", signal.SIGTERM)
+              if force
+              else signal.SIGTERM
+          ),
+      )
+      return
+    except ProcessLookupError:
+      # No such group: everything already exited, or the child never led one.
+      # The returncode check below tells those apart.
+      pass
+    except OSError:
+      logger.warning("Unable to signal process group %d", process.pid)
+  if process.returncode is None:
+    (process.kill if force else process.terminate)()
+
+
+async def _terminate_process_tree(
+    process: asyncio.subprocess.Process,
+) -> None:
+  """Terminates a process tree within bounded waits."""
+  if process.returncode is not None:
+    return
+
+  for force in (False, True):
+    await _signal_process_tree(process, force=force)
+    try:
+      await asyncio.wait_for(
+          process.wait(), timeout=_PROCESS_TERMINATION_GRACE_SECONDS
+      )
+      return
+    except asyncio.TimeoutError:
+      pass
+
+  logger.error("Process tree %d did not terminate cleanly", process.pid)
+
+
+async def _stream_test_output(
+    *,
+    agent_dir: str,
+    test_name: str | None,
+) -> AsyncIterator[bytes]:
+  """Runs pytest and yields bounded output chunks until completion."""
+  cmd_args = [
+      sys.executable,
+      "-m",
+      "pytest",
+      os.path.join(os.path.dirname(__file__), "agent_test_runner.py"),
+      "-s",
+      "-vv",
+  ]
+  if test_name:
+    name_to_use = test_name[:-5] if test_name.endswith(".json") else test_name
+    cmd_args.extend(["-k", name_to_use])
+
+  env = os.environ.copy()
+  env["ADK_TEST_FOLDER"] = agent_dir
+  process = await asyncio.create_subprocess_exec(
+      *cmd_args,
+      stdout=subprocess.PIPE,
+      stderr=subprocess.STDOUT,
+      env=env,
+      creationflags=(
+          getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+          if _IS_WINDOWS
+          else 0
+      ),
+      start_new_session=not _IS_WINDOWS,
+  )
+
+  try:
+    if process.stdout is None:
+      raise RuntimeError("pytest output pipe was not created")
+    while chunk := await process.stdout.read(_TEST_OUTPUT_CHUNK_BYTES):
+      yield chunk
+    await process.wait()
+  finally:
+    with anyio.CancelScope(shield=True):
+      await _terminate_process_tree(process)
+
+
 class DevServer(ApiServer):
   """Development server that extends ApiServer with dev-only endpoints.
 
@@ -198,6 +426,7 @@ class DevServer(ApiServer):
   """
 
   _allow_special_agents: bool = True
+  _serves_debug_trace_endpoints: bool = True
 
   def _get_agent_dir(self, app_name: str) -> str:
     """Resolves the agent directory and validates the app name to prevent path traversal."""
@@ -232,6 +461,48 @@ class DevServer(ApiServer):
       )
 
     return str(resolved_path)
+
+  def _get_test_file_path(self, *, app_name: str, test_name: str) -> str:
+    """Resolves a test file to a path inside the app's own tests directory.
+
+    Every endpoint that turns a caller-supplied test name into a path goes
+    through here, so that none of them can be steered elsewhere on disk.
+
+    Raises:
+      HTTPException: if the app name is invalid, or the test name is anything
+        other than a plain file name sitting directly in that directory.
+    """
+    tests_dir = Path(self._get_agent_dir(app_name)) / "tests"
+    invalid_test_name = HTTPException(
+        status_code=400,
+        detail=(
+            f"Invalid test name: {test_name!r}. A test name must be the name"
+            " of a file directly inside the app's tests directory, not a path."
+        ),
+    )
+
+    # A bare file name only. Backslash is rejected because it separates path
+    # components on Windows, where the route's single-segment match lets it
+    # through.
+    if not test_name or Path(test_name).name != test_name or "\\" in test_name:
+      raise invalid_test_name
+
+    if not test_name.endswith(".json"):
+      test_name += ".json"
+
+    # Resolve before testing containment, so a symlinked test file cannot
+    # point outside either. A name the filesystem cannot resolve at all is
+    # refused rather than allowed through unchecked.
+    try:
+      test_file_path = (tests_dir / test_name).resolve()
+      resolved_tests_dir = tests_dir.resolve()
+    except (OSError, ValueError) as exc:
+      raise invalid_test_name from exc
+
+    if test_file_path.parent != resolved_tests_dir:
+      raise invalid_test_name
+
+    return str(test_file_path)
 
   def _register_dev_endpoints(
       self,
@@ -291,8 +562,10 @@ class DevServer(ApiServer):
     # --- YAML content security ---
     _BLOCKED_YAML_KEYS = frozenset({"args"})
 
-    def _check_yaml_for_blocked_keys(content: bytes, filename: str) -> None:
-      """Raise if the YAML document contains any blocked keys."""
+    def _check_uploaded_yaml(
+        content: bytes, *, filename: str, app_name: str
+    ) -> None:
+      """Raise if the YAML would let the loader run code outside the app."""
       try:
         docs = list(yaml.safe_load_all(content))
       except yaml.YAMLError as exc:
@@ -307,6 +580,14 @@ class DevServer(ApiServer):
                   f"The '{key}' field is not allowed in builder uploads "
                   "because it can execute arbitrary code."
               )
+            if key in _CODE_REFERENCE_KEYS:
+              for reference in _iter_code_references(value):
+                _check_code_reference(
+                    reference,
+                    app_name=app_name,
+                    filename=filename,
+                    field_name=key,
+                )
             _walk(value)
         elif isinstance(node, list):
           for item in node:
@@ -463,7 +744,11 @@ class DevServer(ApiServer):
           uploads.append((rel_path, content))
 
         for rel_path, content in uploads:
-          _check_yaml_for_blocked_keys(content, f"{app_name}/{rel_path}")
+          _check_uploaded_yaml(
+              content,
+              filename=f"{app_name}/{rel_path}",
+              app_name=app_name,
+          )
 
         if tmp:
           app_root = _get_app_root(app_name)
@@ -668,14 +953,10 @@ class DevServer(ApiServer):
         app_name: str, test_name: Optional[str] = None
     ) -> dict[str, str]:
       """Rebuilds tests for the app."""
-      agent_dir = self._get_agent_dir(app_name)
-
       if test_name:
-        if not test_name.endswith(".json"):
-          test_name += ".json"
-        path = os.path.join(agent_dir, "tests", test_name)
+        path = self._get_test_file_path(app_name=app_name, test_name=test_name)
       else:
-        path = agent_dir
+        path = self._get_agent_dir(app_name)
 
       from .agent_test_runner import rebuild_tests
 
@@ -688,93 +969,35 @@ class DevServer(ApiServer):
     ) -> StreamingResponse:
       """Runs tests and streams pytest output."""
       agent_dir = self._get_agent_dir(app_name)
-
-      import subprocess
-      import sys
-
-      queue: asyncio.Queue[str | None] = asyncio.Queue()
-
-      async def run_pytest_subprocess():
-        cmd_args = [
-            sys.executable,
-            "-m",
-            "pytest",
-            os.path.join(os.path.dirname(__file__), "agent_test_runner.py"),
-            "-s",
-            "-vv",
-        ]
-        if test_name:
-          name_to_use = (
-              test_name[:-5] if test_name.endswith(".json") else test_name
-          )
-          cmd_args.extend(["-k", name_to_use])
-
-        # Ensure environment variable is set
-        env = os.environ.copy()
-        env["ADK_TEST_FOLDER"] = agent_dir
-
-        try:
-          process = await asyncio.create_subprocess_exec(
-              *cmd_args,
-              stdout=subprocess.PIPE,
-              stderr=subprocess.STDOUT,
-              env=env,
-          )
-
-          while True:
-            line = await process.stdout.readline()
-            if not line:
-              break
-            await queue.put(line.decode("utf-8"))
-
-          await process.wait()
-        finally:
-          # Signal completion to generator
-          await queue.put(None)
-
-      # Start pytest in a background task
-      asyncio.create_task(run_pytest_subprocess())
-
-      async def generate():
-        while True:
-          item = await queue.get()
-          if item is None:
-            break
-          yield item.encode("utf-8")
-
-      return StreamingResponse(generate(), media_type="text/plain")
+      return StreamingResponse(
+          _stream_test_output(agent_dir=agent_dir, test_name=test_name),
+          media_type="text/plain",
+      )
 
     @app.put("/dev/apps/{app_name}/tests/{test_name}")
     async def create_test(
         app_name: str, test_name: str, req: CreateTestRequest
     ) -> dict[str, str]:
       """Creates or updates a test file from session data."""
-      # Sanitize test_name to prevent directory traversal
-      test_name = os.path.basename(test_name)
-      agent_dir = self._get_agent_dir(app_name)
-      tests_dir = os.path.join(agent_dir, "tests")
-      os.makedirs(tests_dir, exist_ok=True)
+      test_file_path = self._get_test_file_path(
+          app_name=app_name, test_name=test_name
+      )
+      os.makedirs(os.path.dirname(test_file_path), exist_ok=True)
 
-      if not test_name.endswith(".json"):
-        test_name += ".json"
+      with open(test_file_path, "w", encoding="utf-8") as f:
+        json.dump(
+            req.session_data, f, indent=2, sort_keys=True, ensure_ascii=False
+        )
+        f.write("\n")
 
-      test_file_path = os.path.join(tests_dir, test_name)
-
-      with open(test_file_path, "w") as f:
-        json.dump(req.session_data, f, indent=2, sort_keys=True)
-
-      return {"status": "success", "file": test_name}
+      return {"status": "success", "file": os.path.basename(test_file_path)}
 
     @app.delete("/dev/apps/{app_name}/tests/{test_name}")
     async def delete_test(app_name: str, test_name: str) -> dict[str, str]:
       """Deletes a specific test file."""
-      agent_dir = self._get_agent_dir(app_name)
-      tests_dir = os.path.join(agent_dir, "tests")
-
-      if not test_name.endswith(".json"):
-        test_name += ".json"
-
-      test_file_path = os.path.join(tests_dir, test_name)
+      test_file_path = self._get_test_file_path(
+          app_name=app_name, test_name=test_name
+      )
 
       if not os.path.exists(test_file_path):
         raise HTTPException(status_code=404, detail="Test file not found")
@@ -785,18 +1008,14 @@ class DevServer(ApiServer):
     @app.get("/dev/apps/{app_name}/tests/{test_name}")
     async def get_test_content(app_name: str, test_name: str) -> dict[str, Any]:
       """Fetches the content of a specific test file."""
-      agent_dir = self._get_agent_dir(app_name)
-      tests_dir = os.path.join(agent_dir, "tests")
-
-      if not test_name.endswith(".json"):
-        test_name += ".json"
-
-      test_file_path = os.path.join(tests_dir, test_name)
+      test_file_path = self._get_test_file_path(
+          app_name=app_name, test_name=test_name
+      )
 
       if not os.path.exists(test_file_path):
         raise HTTPException(status_code=404, detail="Test file not found")
 
-      with open(test_file_path, "r") as f:
+      with open(test_file_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
     # ========== EVALUATION ENDPOINTS ==========
@@ -821,14 +1040,14 @@ class DevServer(ApiServer):
         ) from ve
 
     # TODO - remove after migration
-    @deprecated(
-        "Please use create_eval_set instead. This will be removed in future"
-        " releases."
-    )
     @app.post(
         "/dev/apps/{app_name}/eval_sets/{eval_set_id}",
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
+    )
+    @deprecated(
+        "Please use create_eval_set instead. This will be removed in future"
+        " releases."
     )
     async def create_eval_set_legacy(
         app_name: str,
@@ -838,32 +1057,32 @@ class DevServer(ApiServer):
       await create_eval_set(
           app_name=app_name,
           create_eval_set_request=CreateEvalSetRequest(
-              eval_set=UserEvalSet(eval_set_id=eval_set_id, eval_cases=[]),
+              eval_set=EvalSet(eval_set_id=eval_set_id, eval_cases=[]),
           ),
       )
 
     # TODO - remove after migration
-    @deprecated(
-        "Please use list_eval_sets instead. This will be removed in future"
-        " releases."
-    )
     @app.get(
         "/dev/apps/{app_name}/eval_sets",
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
+    )
+    @deprecated(
+        "Please use list_eval_sets instead. This will be removed in future"
+        " releases."
     )
     async def list_eval_sets_legacy(app_name: str) -> list[str]:
       list_eval_sets_response = await list_eval_sets(app_name)
       return list_eval_sets_response.eval_set_ids
 
     # TODO - remove after migration
-    @deprecated(
-        "Please use run_eval instead. This will be removed in future releases."
-    )
     @app.post(
         "/dev/apps/{app_name}/eval_sets/{eval_set_id}/run_eval",
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
+    )
+    @deprecated(
+        "Please use run_eval instead. This will be removed in future releases."
     )
     async def run_eval_legacy(
         app_name: str, eval_set_id: str, req: RunEvalRequest
@@ -874,14 +1093,14 @@ class DevServer(ApiServer):
       return run_eval_response.run_eval_results
 
     # TODO - remove after migration
-    @deprecated(
-        "Please use get_eval_result instead. This will be removed in future"
-        " releases."
-    )
     @app.get(
         "/dev/apps/{app_name}/eval_results/{eval_result_id}",
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
+    )
+    @deprecated(
+        "Please use get_eval_result instead. This will be removed in future"
+        " releases."
     )
     async def get_eval_result_legacy(
         app_name: str,
@@ -897,14 +1116,14 @@ class DevServer(ApiServer):
         raise HTTPException(status_code=500, detail=str(ve)) from ve
 
     # TODO - remove after migration
-    @deprecated(
-        "Please use list_eval_results instead. This will be removed in future"
-        " releases."
-    )
     @app.get(
         "/dev/apps/{app_name}/eval_results",
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
+    )
+    @deprecated(
+        "Please use list_eval_results instead. This will be removed in future"
+        " releases."
     )
     async def list_eval_results_legacy(app_name: str) -> list[str]:
       list_eval_results_response = await list_eval_results(app_name)
@@ -1214,9 +1433,26 @@ class DevServer(ApiServer):
 
         # Right now we ignore the app_name as eval metrics are not tied to the
         # app_name, but they could be moving forward.
-        metrics_info = (
-            DEFAULT_METRIC_EVALUATOR_REGISTRY.get_registered_metrics()
-        )
+        # This endpoint feeds a surface that asks the user to pick metrics and
+        # set a threshold for each. Metrics that need no threshold are always
+        # on and have nothing for the user to choose, and they carry no value
+        # interval for a threshold control to bound itself by.
+        #
+        # Hiding them is a compatibility shim for the Dev UI bundle vendored in
+        # cli/browser, which dereferences `metricValueInfo.interval`
+        # unconditionally while building the threshold form and so takes the
+        # whole form down on a metric that has none.
+        # TODO: Drop this filter once that
+        # bundle understands `requires_threshold=False` and renders those
+        # metrics as an always-on, non-selectable section instead. The bundle
+        # ships from this repo, so its refresh and this removal land together.
+        metrics_info = [
+            metric_info
+            for metric_info in (
+                DEFAULT_METRIC_EVALUATOR_REGISTRY.get_registered_metrics()
+            )
+            if metric_info.requires_threshold
+        ]
         return ListMetricsInfoResponse(metrics_info=metrics_info)
       except ModuleNotFoundError as e:
         logger.exception("%s\n%s", MISSING_EVAL_DEPENDENCIES_MESSAGE, e)
@@ -1306,6 +1542,8 @@ class DevServer(ApiServer):
         return GetEventGraphResult(dot_src=dot_graph.source)
       else:
         return {}
+
+    register_dev_deploy_endpoints(app, get_agent_dir=self._get_agent_dir)
 
   def _navigate_to_node(self, app_info: dict, node_path: str) -> dict | None:
     """Navigate to a specific node in the agent hierarchy.

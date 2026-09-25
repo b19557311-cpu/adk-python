@@ -15,7 +15,7 @@
 exclude: ^(src/google/adk/cli/browser/|src/google/adk/v1/|v1_tests/)
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.6.0
+    rev: v6.0.0
     hooks:
       - id: check-yaml
         args: [--allow-multiple-documents]
@@ -50,8 +50,8 @@ repos:
         language: system
         files: \.(py|sh)$
       - id: check-new-py-prefix
-        name: Check new Python files have _ prefix
-        description: Enforces private-by-default policy for new Python files (see .agents/skills/adk-style/references/visibility.md).
+        name: Check new Python files have _ prefix and unit guide
+        description: Enforces private-by-default policy and unit guide requirements for new Python files.
         entry: scripts/check_new_py_files.sh
         language: script
         files: ^src/google/adk/.*\.py$
@@ -64,9 +64,22 @@ repos:
         # This script documents and matches the very patterns it forbids, so
         # it must not scan itself or other dev-only tooling.
         exclude: ^scripts/
+      - id: check-docs
+        name: Check documentation links and guide index
+        description: Verifies that relative links in docs/ and contributing/ resolve, and that every guide is listed in the guides index.
+        entry: scripts/check_docs.py
+        language: script
+        # Deleting or renaming a guide breaks the index without editing any
+        # file this hook would be handed, so it reads the tree itself.
+        always_run: true
+        pass_filenames: false
       - id: update-constraints
         name: update-constraints
-        entry: ./scripts/update_constraints.sh
+        # --check reuses the resolution date recorded in each constraints file.
+        # Update mode recomputes it as "today minus 4 days" and rewrites every
+        # header, which trips pre-commit's "files were modified by this hook".
+        # Refresh the pins by running the script without --check.
+        entry: ./scripts/update_constraints.sh --check
         language: system
         files: ^(pyproject\.toml|constraints-.*\.txt)$
         pass_filenames: false

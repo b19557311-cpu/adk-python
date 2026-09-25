@@ -15,9 +15,11 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 
 from google.adk.agents.base_agent import BaseAgent
 from google.adk.apps.app import App
+from google.adk.evaluation import evaluation_generator as evaluation_generator_module
 from google.adk.evaluation.app_details import AgentDetails
 from google.adk.evaluation.app_details import AppDetails
 from google.adk.evaluation.conversation_scenarios import ConversationScenario
@@ -39,6 +41,7 @@ from google.adk.events.event_actions import EventActions
 from google.adk.models.llm_request import LlmRequest
 from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from google.adk.sessions.session import Session
 from google.genai import types
 import pytest
 
@@ -101,7 +104,12 @@ class TestConvertEventsToEvalInvocation:
     assert invocation.invocation_id == "inv1"
     assert invocation.user_content.parts[0].text == "Hello"
     assert invocation.final_response.parts[0].text == "Hi there!"
-    assert len(invocation.intermediate_data.invocation_events) == 0
+    # The final-response event is kept so that its efficiency metadata
+    # survives, but its text is dropped to avoid duplicating the final
+    # response for judges that read the intermediate events.
+    events = invocation.intermediate_data.invocation_events
+    assert len(events) == 1
+    assert events[0].content is None
 
   def test_convert_keeps_text_response_over_trailing_audio(
       self,
@@ -129,8 +137,10 @@ class TestConvertEventsToEvalInvocation:
     invocation = invocations[0]
     assert invocation.final_response.parts[0].text == "Hello there."
     intermediate = invocation.intermediate_data.invocation_events
-    assert len(intermediate) == 1
-    assert intermediate[0].content.parts[0].inline_data.data == b"fake-audio"
+    assert len(intermediate) == 2
+    # The text event is the final response: kept in order, without its text.
+    assert intermediate[0].content is None
+    assert intermediate[1].content.parts[0].inline_data.data == b"fake-audio"
 
   def test_convert_single_turn_tool_call(
       self,
@@ -188,8 +198,10 @@ class TestConvertEventsToEvalInvocation:
     invocation = invocations[0]
     assert invocation.final_response.parts[0].text == "It is sunny in SF."
     events = invocation.intermediate_data.invocation_events
-    assert len(events) == 1
+    assert len(events) == 2
     assert events[0].content.parts[0].function_call.name == "get_weather"
+    # The final-response event is kept, without its text.
+    assert events[1].content is None
 
   def test_multi_turn(
       self,
@@ -263,11 +275,13 @@ class TestConvertEventsToEvalInvocation:
     assert invocation.final_response.parts[0].text == "All done."
     events = invocation.intermediate_data.invocation_events
 
-    assert len(events) == 4
+    assert len(events) == 5
     assert events[0].author == "root_agent"
     assert events[1].author == "sub_agent_1"
     assert events[2].author == "sub_agent_1"
     assert events[3].author == "sub_agent_2"
+    # The final-response event is kept, without its text.
+    assert events[4].content is None
 
   def test_convert_multi_agent_final_responses(
       self,
@@ -286,10 +300,38 @@ class TestConvertEventsToEvalInvocation:
     assert invocation.final_response.parts[0].text == "Second response"
 
     intermediate_events = invocation.intermediate_data.invocation_events
-    # agent1 is included because it is not the final_event (which is agent2)
-    assert len(intermediate_events) == 1
+    assert len(intermediate_events) == 2
+    # agent1 keeps its content because it is not the final event.
     assert intermediate_events[0].author == "agent1"
     assert intermediate_events[0].content.parts[0].text == "First response"
+    # agent2 is the final event: kept for its metadata, without its text.
+    assert intermediate_events[1].author == "agent2"
+    assert intermediate_events[1].content is None
+
+  def test_convert_preserves_grounding_metadata_from_final_response(
+      self,
+  ):
+    """Tests final grounding metadata is available to evaluators."""
+    grounding_metadata = types.GroundingMetadata(
+        web_search_queries=["recent AI news"]
+    )
+    events = [
+        _build_event("user", [types.Part(text="What's new in AI?")], "inv1"),
+        Event(
+            author="agent",
+            content=types.Content(parts=[types.Part(text="Here are sources.")]),
+            invocation_id="inv1",
+            grounding_metadata=grounding_metadata,
+        ),
+    ]
+
+    invocations = EvaluationGenerator.convert_events_to_eval_invocations(events)
+
+    assert len(invocations) == 1
+    invocation_events = invocations[0].intermediate_data.invocation_events
+    assert len(invocation_events) == 1
+    assert invocation_events[0].content is None
+    assert invocation_events[0].grounding_metadata == grounding_metadata
 
 
 class TestNormalizeLiveTranscriptions:
@@ -949,6 +991,72 @@ class TestGenerateInferencesFromRootAgent:
     assert called_with_content.parts[0].text == "message 1"
 
   @pytest.mark.asyncio
+  async def test_records_a_duration_for_each_invocation(
+      self, mocker, mock_runner, mock_session_service
+  ):
+    """Each turn is timed while it runs and the durations reach the converter.
+
+    Timing is taken here rather than reconstructed from event timestamps
+    afterwards: an event is stamped when it is constructed, which for a model
+    call is before the request is even sent, so a span between such stamps
+    would omit the last call entirely.
+    """
+    mock_agent = mocker.MagicMock()
+    mock_user_sim = mocker.MagicMock(spec=UserSimulator)
+
+    async def get_next_user_message_side_effect(*args, **kwargs):
+      count = mock_user_sim.get_next_user_message.call_count
+      if count <= 2:
+        return NextUserMessage(
+            status=UserSimulatorStatus.SUCCESS,
+            user_message=types.Content(
+                parts=[types.Part(text=f"message {count}")]
+            ),
+        )
+      return NextUserMessage(status=UserSimulatorStatus.STOP_SIGNAL_DETECTED)
+
+    mock_user_sim.get_next_user_message = mocker.AsyncMock(
+        side_effect=get_next_user_message_side_effect
+    )
+
+    mock_generate_inferences = mocker.patch(
+        "google.adk.evaluation.evaluation_generator.EvaluationGenerator._generate_inferences_for_single_user_invocation"
+    )
+    mocker.patch(
+        "google.adk.evaluation.evaluation_generator.EvaluationGenerator._get_app_details_by_invocation_id"
+    )
+    mock_convert = mocker.patch(
+        "google.adk.evaluation.evaluation_generator.EvaluationGenerator.convert_events_to_eval_invocations"
+    )
+
+    turns = iter(["inv1", "inv2"])
+
+    async def mock_generate_inferences_side_effect(
+        runner, user_id, session_id, user_content
+    ):
+      invocation_id = next(turns)
+      yield _build_event("user", user_content.parts, invocation_id)
+      yield _build_event("agent", [types.Part(text="ok")], invocation_id)
+
+    mock_generate_inferences.side_effect = mock_generate_inferences_side_effect
+
+    await EvaluationGenerator._generate_inferences_from_root_agent(
+        root_agent=mock_agent,
+        user_simulator=mock_user_sim,
+    )
+
+    durations = mock_convert.call_args.args[2]
+    # One entry per turn, keyed by that turn's invocation id.
+    assert set(durations) == {"inv1", "inv2"}
+    assert all(duration >= 0 for duration in durations.values())
+    # Rounded to milliseconds rather than carrying the float's full, and
+    # meaningless, precision. A raw `time.monotonic()` difference would keep
+    # far more digits than this.
+    assert all(
+        duration == round(duration, 3) for duration in durations.values()
+    )
+
+  @pytest.mark.asyncio
   async def test_pinned_session_id_reused_across_runs_no_collision(
       self, mocker, mock_runner
   ):
@@ -1340,6 +1448,380 @@ class TestLiveSessionCallbacks:
     assert called_after_args.kwargs["llm_response"] == mock_event
 
 
+class TestLiveSessionNodeRouting:
+  """Verifies non-Agent BaseNode roots are driven via `Runner.run_live`."""
+
+  @pytest.mark.asyncio
+  async def test_workflow_root_uses_runner_run_live(self, mocker):
+    from google.adk.workflow import Workflow
+
+    # A Workflow has no `_llm_flow`/`run_live`; the session must fall back to
+    # `Runner.run_live`, which handles node scheduling and function calls.
+    mock_workflow = mocker.MagicMock(spec=Workflow)
+    mock_runner = mocker.MagicMock()
+    mock_runner.agent = mock_workflow
+
+    mock_event = Event(
+        author="agent",
+        content=types.Content(parts=[types.Part(text="Hi")]),
+        invocation_id="unused",
+        turn_complete=True,
+    )
+
+    async def mock_run_live(*args, **kwargs):
+      yield mock_event
+
+    mock_runner.run_live.return_value = mock_run_live()
+
+    live_session = _LiveSession(
+        runner=mock_runner,
+        session=mocker.MagicMock(),
+        user_id="test_user",
+        session_id="test_session",
+    )
+
+    await live_session._consume_events()
+
+    # The Agent-only driver must not be touched for a Workflow root.
+    mock_runner._new_invocation_context_for_live.assert_not_called()
+    mock_runner.run_live.assert_called_once()
+    call_kwargs = mock_runner.run_live.call_args.kwargs
+    assert call_kwargs["user_id"] == "test_user"
+    assert call_kwargs["session_id"] == "test_session"
+
+    # The event is re-stamped with the turn's invocation id and enqueued, and
+    # the agent's turn-complete releases the waiter.
+    queued_event = await live_session.event_queue.get()
+    assert queued_event.invocation_id == live_session.current_invocation_id
+    assert live_session.turn_complete_event.is_set()
+    assert live_session.live_finished.is_set()
+
+  @pytest.mark.asyncio
+  async def test_workflow_root_swallows_tool_call_turn_complete(self, mocker):
+    from google.adk.workflow import Workflow
+
+    # The intermediate `turn_complete` that accompanies a tool call must not
+    # release the waiter; only the true end-of-turn after the model continues.
+    mock_workflow = mocker.MagicMock(spec=Workflow)
+    mock_runner = mocker.MagicMock()
+    mock_runner.agent = mock_workflow
+
+    # A tool call and its `turn_complete` arrive as separate events.
+    fc_event = Event(
+        author="dob_verifier_agent",
+        content=types.Content(
+            parts=[
+                types.Part(
+                    function_call=types.FunctionCall(
+                        name="validate_date_of_birth",
+                        args={"dob": "1985-07-12"},
+                    )
+                )
+            ]
+        ),
+        invocation_id="unused",
+    )
+    intermediate_turn_complete = Event(
+        author="dob_verifier_agent",
+        invocation_id="unused",
+        turn_complete=True,
+    )
+    # The real end-of-turn after the model continues.
+    final_event = Event(
+        author="dob_verifier_agent",
+        content=types.Content(
+            parts=[types.Part(text="Your identity is verified.")]
+        ),
+        invocation_id="unused",
+        turn_complete=True,
+    )
+
+    async def mock_run_live(*args, **kwargs):
+      yield fc_event
+      assert not live_session.turn_complete_event.is_set()
+      yield intermediate_turn_complete
+      assert not live_session.turn_complete_event.is_set()
+      yield final_event
+
+    mock_runner.run_live.return_value = mock_run_live()
+
+    live_session = _LiveSession(
+        runner=mock_runner,
+        session=mocker.MagicMock(),
+        user_id="test_user",
+        session_id="test_session",
+    )
+    mocker.patch.object(
+        live_session,
+        "_record_node_app_details",
+        new=mocker.AsyncMock(return_value={}),
+    )
+
+    await live_session._consume_node_events()
+
+    # The waiter is released only on the true end-of-turn.
+    assert live_session.turn_complete_event.is_set()
+
+  @pytest.mark.asyncio
+  async def test_workflow_root_finish_task_does_not_swallow_next_turn(
+      self, mocker
+  ):
+    from google.adk.workflow import Workflow
+
+    # `finish_task` hands off to the next agent, so its following `turn_complete`
+    # (the next agent's question) is a real end-of-turn and must not be swallowed
+    # -- otherwise the harness hangs.
+    mock_workflow = mocker.MagicMock(spec=Workflow)
+    mock_runner = mocker.MagicMock()
+    mock_runner.agent = mock_workflow
+
+    finish_task_event = Event(
+        author="greeter_agent",
+        content=types.Content(
+            parts=[
+                types.Part(
+                    function_call=types.FunctionCall(
+                        name="finish_task", args={"result": "John Doe"}
+                    )
+                )
+            ]
+        ),
+        invocation_id="unused",
+    )
+    # The next agent takes over and asks its first question, ending the turn.
+    next_agent_turn = Event(
+        author="dob_verifier_agent",
+        content=types.Content(
+            parts=[types.Part(text="What is your date of birth?")]
+        ),
+        invocation_id="unused",
+        turn_complete=True,
+    )
+
+    async def mock_run_live(*args, **kwargs):
+      yield finish_task_event
+      yield next_agent_turn
+
+    mock_runner.run_live.return_value = mock_run_live()
+
+    live_session = _LiveSession(
+        runner=mock_runner,
+        session=mocker.MagicMock(),
+        user_id="test_user",
+        session_id="test_session",
+    )
+    mocker.patch.object(
+        live_session,
+        "_record_node_app_details",
+        new=mocker.AsyncMock(return_value={}),
+    )
+
+    await live_session._consume_node_events()
+
+    # The next agent's turn_complete must release the waiter.
+    assert live_session.turn_complete_event.is_set()
+
+  @pytest.mark.asyncio
+  async def test_workflow_root_tolerates_normal_ws_closure(self, mocker):
+    from google.adk.workflow import Workflow
+    from google.genai import errors
+
+    # The node runner unwraps the end-of-session `1000` closure and re-raises it
+    # from `run_live`; the session must treat it as a normal end of stream
+    # rather than aborting the eval case.
+    mock_workflow = mocker.MagicMock(spec=Workflow)
+    mock_runner = mocker.MagicMock()
+    mock_runner.agent = mock_workflow
+
+    async def mock_run_live(*args, **kwargs):
+      raise errors.APIError(1000, {}, None)
+      yield  # pragma: no cover - makes this an async generator
+
+    mock_runner.run_live.return_value = mock_run_live()
+
+    live_session = _LiveSession(
+        runner=mock_runner,
+        session=mocker.MagicMock(),
+        user_id="test_user",
+        session_id="test_session",
+    )
+
+    # Must not raise; the normal closure is swallowed.
+    await live_session._consume_events()
+
+    # The `finally` still flags the stream finished and unblocks waiters.
+    assert live_session.live_finished.is_set()
+    assert live_session.turn_complete_event.is_set()
+
+  @pytest.mark.asyncio
+  async def test_workflow_root_reraises_abnormal_ws_closure(self, mocker):
+    from google.adk.workflow import Workflow
+    from google.genai import errors
+
+    # A non-1000 closure is a real failure and must propagate.
+    mock_workflow = mocker.MagicMock(spec=Workflow)
+    mock_runner = mocker.MagicMock()
+    mock_runner.agent = mock_workflow
+
+    async def mock_run_live(*args, **kwargs):
+      raise errors.APIError(1011, {}, None)
+      yield  # pragma: no cover - makes this an async generator
+
+    mock_runner.run_live.return_value = mock_run_live()
+
+    live_session = _LiveSession(
+        runner=mock_runner,
+        session=mocker.MagicMock(),
+        user_id="test_user",
+        session_id="test_session",
+    )
+
+    with pytest.raises(errors.APIError):
+      await live_session._consume_events()
+
+  @pytest.mark.asyncio
+  async def test_workflow_fires_after_model_callback_by_author(self, mocker):
+    from google.adk.workflow import Workflow
+
+    mock_workflow = mocker.MagicMock(spec=Workflow)
+    mock_runner = mocker.MagicMock()
+    mock_runner.agent = mock_workflow
+    mock_runner.plugin_manager.run_after_model_callback = mocker.AsyncMock()
+
+    greeter_event = Event(author="greeter", invocation_id="x")
+    other_event = Event(author="unrecorded_agent", invocation_id="x")
+
+    async def mock_run_live(*args, **kwargs):
+      yield greeter_event
+      yield other_event
+
+    mock_runner.run_live.return_value = mock_run_live()
+
+    live_session = _LiveSession(
+        runner=mock_runner,
+        session=mocker.MagicMock(),
+        user_id="u",
+        session_id="s",
+    )
+    greeter_context = mocker.MagicMock()
+    mocker.patch.object(
+        live_session,
+        "_record_node_app_details",
+        new=mocker.AsyncMock(return_value={"greeter": greeter_context}),
+    )
+
+    await live_session._consume_node_events()
+
+    # Only the recorded author's events replay after_model_callback, and with
+    # that author's callback context.
+    mock_runner.plugin_manager.run_after_model_callback.assert_called_once_with(
+        callback_context=greeter_context, llm_response=greeter_event
+    )
+
+
+class TestLiveSessionNodeAppDetails:
+  """Verifies the stop-gap that records autorater app details for node roots.
+
+  ``_record_app_details_for_agent`` (the per-agent preprocess + callback firing)
+  is exercised by ``TestLiveSessionCallbacks``; here we focus on the node graph
+  enumeration/mapping/skip logic in ``_record_node_app_details``.
+  """
+
+  def _make_agent_node(self, mocker, name: str):
+    from google.adk.agents.llm_agent import Agent
+
+    agent = mocker.MagicMock(spec=Agent)
+    agent.name = name
+    return agent
+
+  def _make_runner(self, mocker, nodes):
+    mock_workflow = mocker.MagicMock()
+    mock_workflow.graph.nodes = nodes
+
+    mock_runner = mocker.MagicMock()
+    mock_runner.agent = mock_workflow
+    # `model_copy` carries the target agent onto the per-agent context so
+    # `_record_app_details_for_agent` sees the right agent.
+    base_ic = mock_runner._new_invocation_context_for_live.return_value
+    base_ic.model_copy.side_effect = lambda update: mocker.MagicMock(
+        agent=update["agent"]
+    )
+    return mock_runner
+
+  @pytest.mark.asyncio
+  async def test_record_node_app_details_maps_each_agent(self, mocker):
+    greeter = self._make_agent_node(mocker, "greeter")
+    verifier = self._make_agent_node(mocker, "verifier")
+    mock_runner = self._make_runner(mocker, [greeter, verifier])
+
+    live_session = _LiveSession(
+        runner=mock_runner,
+        session=mocker.MagicMock(),
+        user_id="u",
+        session_id="s",
+    )
+
+    # Return a distinct callback context per recorded agent.
+    greeter_context = mocker.sentinel.greeter_context
+    verifier_context = mocker.sentinel.verifier_context
+    mocker.patch.object(
+        live_session,
+        "_record_app_details_for_agent",
+        new=mocker.AsyncMock(side_effect=[greeter_context, verifier_context]),
+    )
+
+    callback_context_by_author = await live_session._record_node_app_details()
+
+    assert callback_context_by_author == {
+        "greeter": greeter_context,
+        "verifier": verifier_context,
+    }
+
+  @pytest.mark.asyncio
+  async def test_record_node_app_details_no_graph_returns_empty(self, mocker):
+    mock_runner = mocker.MagicMock()
+    mock_runner.agent = object()  # no `graph` attribute
+
+    live_session = _LiveSession(
+        runner=mock_runner,
+        session=mocker.MagicMock(),
+        user_id="u",
+        session_id="s",
+    )
+
+    assert await live_session._record_node_app_details() == {}
+
+  @pytest.mark.asyncio
+  async def test_record_node_app_details_skips_failed_agent(self, mocker):
+    good = self._make_agent_node(mocker, "good")
+    bad = self._make_agent_node(mocker, "bad")
+    mock_runner = self._make_runner(mocker, [bad, good])
+
+    live_session = _LiveSession(
+        runner=mock_runner,
+        session=mocker.MagicMock(),
+        user_id="u",
+        session_id="s",
+    )
+
+    good_context = mocker.sentinel.good_context
+
+    async def record(ic):
+      if ic.agent.name == "bad":
+        raise RuntimeError("boom")
+      return good_context
+
+    mocker.patch.object(
+        live_session,
+        "_record_app_details_for_agent",
+        new=mocker.AsyncMock(side_effect=record),
+    )
+
+    # The failing agent is skipped; the healthy one is still recorded.
+    callback_context_by_author = await live_session._record_node_app_details()
+    assert callback_context_by_author == {"good": good_context}
+
+
 def test_convert_events_preserves_tool_calls_when_skip_summarization():
   """Regression test for tool calls dropped from invocation_events.
 
@@ -1513,3 +1995,266 @@ class TestGenerateInferencesFromRootAgentWithApp:
     assert runner_app.root_agent is sub_agent
     # User's App must be untouched.
     assert app.root_agent is full_root
+
+
+# -----------------------------------------------------------------------------
+# `generate_responses_from_session` -- replays a recorded session file instead of
+# invoking an agent, annotating each eval row with what the session actually did.
+# -----------------------------------------------------------------------------
+
+
+def _write_session_file(tmp_path, events: list[Event]) -> str:
+  session = Session(
+      id="recorded_session",
+      app_name="test_app",
+      user_id="test_user",
+      events=events,
+  )
+  session_file = tmp_path / "session.json"
+  session_file.write_text(session.model_dump_json())
+  return str(session_file)
+
+
+def _recorded_events() -> list[Event]:
+  return [
+      _build_event("user", [types.Part(text="Roll a 6 sided dice")], "inv1"),
+      _build_event(
+          "agent",
+          [
+              types.Part(
+                  function_call=types.FunctionCall(
+                      name="roll_die", args={"sides": 6}
+                  )
+              )
+          ],
+          "inv1",
+      ),
+      _build_event("agent", [types.Part(text="I rolled a 4.")], "inv1"),
+      _build_event("user", [types.Part(text="Thanks")], "inv2"),
+      _build_event("agent", [types.Part(text="You are welcome.")], "inv2"),
+  ]
+
+
+def test_generate_responses_from_session_annotates_rows_from_session(tmp_path):
+  """Each eval row gains the tool calls and final text of its invocation."""
+  session_path = _write_session_file(tmp_path, _recorded_events())
+  eval_dataset = [[
+      {"query": "Roll a 6 sided dice"},
+      {"query": "Thanks"},
+  ]]
+
+  results = EvaluationGenerator.generate_responses_from_session(
+      session_path, eval_dataset
+  )
+
+  # One result per entry in the eval dataset.
+  assert len(results) == 1
+  first, second = results[0]
+  assert first["actual_tool_use"] == [
+      {"tool_name": "roll_die", "tool_input": {"sides": 6}}
+  ]
+  assert first["response"] == "I rolled a 4."
+  # The second invocation used no tools.
+  assert second["actual_tool_use"] == []
+  assert second["response"] == "You are welcome."
+
+
+def test_generate_responses_from_session_query_absent_from_session(tmp_path):
+  """A query the session never saw yields no tool calls and no response."""
+  session_path = _write_session_file(tmp_path, _recorded_events())
+
+  results = EvaluationGenerator.generate_responses_from_session(
+      session_path, [[{"query": "Roll a 20 sided dice"}]]
+  )
+
+  assert results[0][0]["actual_tool_use"] == []
+  assert results[0][0]["response"] is None
+
+
+def test_generate_responses_from_session_scopes_by_invocation_id(tmp_path):
+  """Only events sharing the matched user event's invocation id are used."""
+  events = [
+      _build_event("user", [types.Part(text="Roll a 6 sided dice")], "inv1"),
+      _build_event("agent", [types.Part(text="I rolled a 4.")], "inv1"),
+      # A different invocation whose tool call must not leak into inv1.
+      _build_event("user", [types.Part(text="Book a flight")], "inv2"),
+      _build_event(
+          "agent",
+          [
+              types.Part(
+                  function_call=types.FunctionCall(
+                      name="book_flight", args={"to": "LAX"}
+                  )
+              )
+          ],
+          "inv2",
+      ),
+  ]
+  session_path = _write_session_file(tmp_path, events)
+
+  results = EvaluationGenerator.generate_responses_from_session(
+      session_path, [[{"query": "Roll a 6 sided dice"}]]
+  )
+
+  assert results[0][0]["actual_tool_use"] == []
+  assert results[0][0]["response"] == "I rolled a 4."
+
+
+_real_open = builtins.open
+
+
+def _non_utf8_default_open(file, mode="r", *args, **kwargs):
+  """Emulates a platform whose default text encoding is not UTF-8.
+
+  Falls back to ASCII when a text-mode open does not specify an encoding, so a
+  missing `encoding="utf-8"` argument raises instead of silently depending on
+  the host locale (for example cp1252 on Windows).
+  """
+  if "b" not in mode and "encoding" not in kwargs:
+    kwargs["encoding"] = "ascii"
+  return _real_open(file, mode, *args, **kwargs)
+
+
+def test_generate_responses_from_session_reads_non_ascii_with_non_utf8_default(
+    tmp_path, mocker
+):
+  """The session file must be read as UTF-8 regardless of platform locale.
+
+  Session files serialized via `model_dump_json` contain raw (unescaped)
+  non-ASCII characters, so reading them without an explicit UTF-8 encoding
+  fails on platforms whose default encoding is not UTF-8.
+  """
+  non_ascii_text = "😀 你好 café"
+  session = Session(
+      id="s1",
+      app_name="app",
+      user_id="u1",
+      events=[
+          Event(
+              author="user",
+              invocation_id="inv1",
+              content=types.Content(
+                  role="user", parts=[types.Part(text=non_ascii_text)]
+              ),
+          ),
+          Event(
+              author="agent",
+              invocation_id="inv1",
+              content=types.Content(
+                  role="model",
+                  parts=[types.Part(text="response " + non_ascii_text)],
+              ),
+          ),
+      ],
+  )
+  session_path = tmp_path / "session.json"
+  session_path.write_text(session.model_dump_json(), encoding="utf-8")
+
+  mocker.patch.object(
+      evaluation_generator_module, "open", _non_utf8_default_open, create=True
+  )
+
+  results = EvaluationGenerator.generate_responses_from_session(
+      str(session_path), [[{"query": non_ascii_text}]]
+  )
+
+  assert results[0][0]["query"] == non_ascii_text
+  assert results[0][0]["response"] == "response " + non_ascii_text
+
+
+def test_convert_events_records_invocation_events_including_final_response():
+  """Invocation events capture metadata (usage/model) for efficiency.
+
+  This includes the final response event, whose metadata is preserved on
+  InvocationEvent while its text content is omitted to prevent duplication.
+  """
+  events = [
+      Event(
+          invocation_id="inv1",
+          author="user",
+          content=types.Content(parts=[types.Part(text="Hi")], role="user"),
+          timestamp=1000.0,
+      ),
+      Event(
+          invocation_id="inv1",
+          author="agent",
+          content=types.Content(
+              parts=[
+                  types.Part(
+                      function_call=types.FunctionCall(name="tool1", args={})
+                  )
+              ]
+          ),
+          model_version="gemini-2.5-flash",
+          usage_metadata=types.GenerateContentResponseUsageMetadata(
+              prompt_token_count=10,
+              candidates_token_count=5,
+              total_token_count=15,
+          ),
+      ),
+      # Tool-result event: framework produced, no model usage metadata.
+      Event(
+          invocation_id="inv1",
+          author="agent",
+          content=types.Content(
+              parts=[
+                  types.Part(
+                      function_response=types.FunctionResponse(
+                          name="tool1", response={"result": "ok"}
+                      )
+                  )
+              ]
+          ),
+      ),
+      # Final response event: metadata is captured on InvocationEvent even
+      # though plain text content is omitted from intermediate events.
+      Event(
+          invocation_id="inv1",
+          author="agent",
+          content=types.Content(parts=[types.Part(text="All done.")]),
+          model_version="gemini-2.5-flash",
+          usage_metadata=types.GenerateContentResponseUsageMetadata(
+              prompt_token_count=20,
+              candidates_token_count=8,
+              total_token_count=28,
+          ),
+      ),
+  ]
+
+  invocations = EvaluationGenerator.convert_events_to_eval_invocations(events)
+
+  assert len(invocations) == 1
+  invocation = invocations[0]
+  assert invocation.final_response == types.Content(
+      parts=[types.Part(text="All done.")]
+  )
+  invocation_events = invocation.intermediate_data.invocation_events
+  assert len(invocation_events) == 3
+  # First event: function call
+  assert invocation_events[0].content is not None
+  assert invocation_events[0].usage_metadata.total_token_count == 15
+  assert invocation_events[0].model_version == "gemini-2.5-flash"
+  # Second event: tool response
+  assert invocation_events[1].content is not None
+  assert invocation_events[1].usage_metadata is None
+  # Third event: final response (content omitted to prevent judge duplication)
+  assert invocation_events[2].content is None
+  assert invocation_events[2].usage_metadata.total_token_count == 28
+  assert invocation_events[2].model_version == "gemini-2.5-flash"
+
+
+def test_convert_events_empty_invocation_events_when_no_agent_events():
+  """invocation_events is empty for an invocation with no agent events."""
+  events = [
+      Event(
+          invocation_id="inv1",
+          author="user",
+          content=types.Content(parts=[types.Part(text="Hi")], role="user"),
+          timestamp=1000.0,
+      ),
+  ]
+
+  invocations = EvaluationGenerator.convert_events_to_eval_invocations(events)
+
+  assert len(invocations) == 1
+  assert invocations[0].intermediate_data.invocation_events == []

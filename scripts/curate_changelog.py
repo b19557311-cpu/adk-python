@@ -24,7 +24,9 @@ newest version section, in order:
    landed under several commits), and lowercase the leading word so entries
    read as consistent imperative phrases.
 2. Draft a short "Highlights" block with Gemini and place it above the fold, so
-   a reader grasps the release in a handful of bullets.
+   a reader grasps the release in a handful of bullets. The drafted prose is
+   unwrapped to one line per paragraph and per bullet, because GitHub renders a
+   single newline as a line break.
 3. For large releases, collapse the full categorized list under a ``<details>``
    fold so the notes read short while remaining a complete record.
 
@@ -52,9 +54,17 @@ _VERSION_RE = re.compile(r"^## \[")
 _SUBSECTION_RE = re.compile(r"^### ")
 # Matches a changelog entry bullet.
 _ENTRY_RE = re.compile(r"^\s*\* ")
-# Trailing " ([abc1234](url))..." on an entry; stripped only to build the dedupe
-# key so two commits with the same subject collapse to one.
-_TRAILER_RE = re.compile(r"\s*\(\[[0-9a-f]{6,}\]\(.*$")
+# Trailing commit hashes, PR references, issue closures, and links on an entry;
+# stripped only to build the dedupe key so commits with the same subject collapse.
+_TRAILER_RE = re.compile(
+    r"\s*(?:"
+    r"\(?\[[0-9a-f]{6,}\](?:\([^)]*\))?\)?"
+    r"|\(?\[#\d+\](?:\([^)]*\))?\)?"
+    r"|\(\s*#\d+\s*\)"
+    r"|,?\s*(?:closes|fixes|resolves)\s+(?:\[#\d+\](?:\([^)]*\))?|#\d+)"
+    r")+\s*$",
+    re.IGNORECASE,
+)
 # An accidental "[@name](https://github.com/name)" auto-link, produced when a
 # commit subject contained a bare "@name" (e.g. "... in @node decorator").
 _MENTION_RE = re.compile(r"\[@([\w-]+)\]\(https://github\.com/\1\)")
@@ -62,6 +72,11 @@ _MENTION_RE = re.compile(r"\[@([\w-]+)\]\(https://github\.com/\1\)")
 _LEAD_RE = re.compile(
     r"(?P<head>\s*\* (?:\*\*[^*]+\*\* )?)(?P<first>\w+)(?P<rest>.*)", re.S
 )
+# Opens a list item. A wrapped continuation is joined onto one of these.
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+] |\d+\. )")
+# Lines whose meaning depends on standing alone: headers, table rows, block
+# quotes, code fences. A wrapped continuation is never joined onto one.
+_STANDALONE_RE = re.compile(r"^\s*(?:#{1,6} |[|>]|```)")
 
 # Inserted verbatim when the model is unavailable, so the release manager has a
 # scaffold to fill in by hand. Mirrors the format the model is asked to produce.
@@ -96,7 +111,8 @@ Write a short Highlights section so a reader can grasp the release at a glance:
   the bullets, each with a one-line migration note.
 
 Output ONLY the markdown body. Do NOT include the "### Highlights" header and do
-NOT wrap the output in code fences.
+NOT wrap the output in code fences. Put each paragraph and each bullet on a
+single line, however long; do not hard-wrap them.
 
 Changelog for the new version:
 
@@ -152,7 +168,8 @@ def _normalize_entry(line: str) -> str:
 
 def _dedupe_key(line: str) -> str:
   """Key for detecting the same change landed under multiple commits."""
-  core = _TRAILER_RE.sub("", line)  # drop the "([hash](url))" trailer
+  core = _TRAILER_RE.sub("", line)  # drop trailing commit hash/PR links
+  core = re.sub(r"[\s\.,;:]+$", "", core)  # strip trailing punctuation
   return re.sub(r"\s+", " ", core).strip().lower()
 
 
@@ -206,9 +223,35 @@ def _draft_highlights(section_text: str, *, model: str) -> str | None:
     return None
 
 
+def _unwrap_lines(text: str) -> str:
+  """Joins each hard-wrapped paragraph and list item back onto one line.
+
+  Markdown treats a wrapped paragraph as one paragraph, but GitHub does not:
+  in a pull request body or a release note it renders every newline as a line
+  break, so prose a model wrapped at 80 columns breaks mid-sentence. Blank
+  lines, headers, table rows, quotes and fenced blocks keep their own lines.
+  """
+  out: list[str] = []
+  fenced = False
+  for line in text.splitlines():
+    stripped = line.strip()
+    if stripped.startswith("```"):
+      fenced = not fenced
+      out.append(line.rstrip())
+    elif fenced or not stripped:
+      out.append(line.rstrip())
+    elif _LIST_ITEM_RE.match(line) or _STANDALONE_RE.match(line):
+      out.append(line.rstrip())
+    elif out and out[-1].strip() and not _STANDALONE_RE.match(out[-1]):
+      out[-1] = f"{out[-1]} {stripped}"
+    else:
+      out.append(stripped)
+  return "\n".join(out)
+
+
 def _build_block(body: str) -> str:
   """Wraps a model-drafted body in the Highlights header."""
-  body = body.strip()
+  body = _unwrap_lines(body).strip()
   if body.startswith(_HIGHLIGHTS_HEADER):
     body = body[len(_HIGHLIGHTS_HEADER) :].lstrip("\n")
   return f"{_HIGHLIGHTS_HEADER}\n\n{body}\n"
@@ -281,7 +324,7 @@ def main() -> int:
   )
   parser.add_argument(
       "--model",
-      default=os.environ.get("CHANGELOG_CURATION_MODEL", "gemini-2.5-flash"),
+      default=os.environ.get("CHANGELOG_CURATION_MODEL", "gemini-3.5-flash"),
       help="Gemini model used to draft the Highlights.",
   )
   parser.add_argument(

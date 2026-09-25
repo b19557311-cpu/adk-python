@@ -14,11 +14,18 @@
 
 from __future__ import annotations
 
+import copy
 import logging
+from typing import cast
 from typing import Optional
+from typing import Protocol
 
 from ..errors.not_found_error import NotFoundError
 from ..utils.feature_decorator import experimental
+from ._efficiency_evaluators import _InferenceCallCountV1Evaluator
+from ._efficiency_evaluators import _InvocationDurationV1Evaluator
+from ._efficiency_evaluators import _TokenUsageV1Evaluator
+from ._efficiency_evaluators import _ToolCallCountV1Evaluator
 from .custom_metric_evaluator import _CustomMetricEvaluator
 from .eval_config import EvalConfig
 from .eval_metrics import EvalMetric
@@ -31,6 +38,8 @@ from .final_response_match_v2 import FinalResponseMatchV2Evaluator
 from .hallucinations_v1 import HallucinationsV1Evaluator
 from .metric_info_providers import FinalResponseMatchV2EvaluatorMetricInfoProvider
 from .metric_info_providers import HallucinationsV1EvaluatorMetricInfoProvider
+from .metric_info_providers import InferenceCallCountV1MetricInfoProvider
+from .metric_info_providers import InvocationDurationV1MetricInfoProvider
 from .metric_info_providers import MultiTurnTaskSuccessV1MetricInfoProvider
 from .metric_info_providers import MultiTurnToolUseQualityV1MetricInfoProvider
 from .metric_info_providers import MultiTurnTrajectoryQualityV1MetricInfoProvider
@@ -40,6 +49,8 @@ from .metric_info_providers import RubricBasedFinalResponseQualityV1EvaluatorMet
 from .metric_info_providers import RubricBasedMultiTurnTrajectoryMetricInfoProvider
 from .metric_info_providers import RubricBasedToolUseV1EvaluatorMetricInfoProvider
 from .metric_info_providers import SafetyEvaluatorV1MetricInfoProvider
+from .metric_info_providers import TokenUsageV1MetricInfoProvider
+from .metric_info_providers import ToolCallCountV1MetricInfoProvider
 from .metric_info_providers import TrajectoryEvaluatorMetricInfoProvider
 from .multi_turn_task_success_evaluator import MultiTurnTaskSuccessV1Evaluator
 from .multi_turn_tool_use_quality_evaluator import MultiTurnToolUseQualityV1Evaluator
@@ -53,6 +64,12 @@ from .simulation.per_turn_user_simulator_quality_v1 import PerTurnUserSimulatorQ
 from .trajectory_evaluator import TrajectoryEvaluator
 
 logger = logging.getLogger("google_adk." + __name__)
+
+
+class _EvalMetricEvaluatorFactory(Protocol):
+
+  def __call__(self, *, eval_metric: EvalMetric) -> Evaluator:
+    """Creates an evaluator for one metric configuration."""
 
 
 @experimental
@@ -94,7 +111,8 @@ class MetricEvaluatorRegistry:
           eval_metric=eval_metric,
           custom_function_path=custom_function_path,
       )
-    return evaluator_type(eval_metric=eval_metric)
+    evaluator_factory = cast(_EvalMetricEvaluatorFactory, evaluator_type)
+    return evaluator_factory(eval_metric=eval_metric)
 
   def _custom_function_path(self, eval_metric: EvalMetric) -> Optional[str]:
     """Returns the module path to import for a custom metric, if known.
@@ -161,6 +179,25 @@ class MetricEvaluatorRegistry:
         for _, evaluator_and_metric_info in self._registry.items()
     ]
 
+  def fork(self) -> MetricEvaluatorRegistry:
+    """Returns an isolated copy of this registry.
+
+    The copy starts out with everything registered here, so evaluators that
+    callers registered on `DEFAULT_METRIC_EVALUATOR_REGISTRY` remain
+    resolvable. Registrations made afterwards on either registry are invisible
+    to the other, which is what makes it safe to register the custom metrics of
+    a single eval run without mutating process-wide state.
+    """
+    # Copied rather than constructed: `__init__` would re-register the standard
+    # metrics only for them to be overwritten below, and would emit the
+    # `@experimental` warning on every eval run.
+    forked = copy.copy(self)
+    # pylint: disable=protected-access
+    forked._registry = dict(self._registry)
+    forked._custom_function_paths = dict(self._custom_function_paths)
+    # pylint: enable=protected-access
+    return forked
+
 
 def _register_standard_metrics(
     metric_evaluator_registry: MetricEvaluatorRegistry,
@@ -222,6 +259,24 @@ def _register_standard_metrics(
   metric_evaluator_registry.register_evaluator(
       metric_info=RubricBasedMultiTurnTrajectoryMetricInfoProvider().get_metric_info(),
       evaluator=RubricBasedMultiTurnTrajectoryEvaluator,
+  )
+
+  # Efficiency metrics.
+  metric_evaluator_registry.register_evaluator(
+      metric_info=ToolCallCountV1MetricInfoProvider().get_metric_info(),
+      evaluator=_ToolCallCountV1Evaluator,
+  )
+  metric_evaluator_registry.register_evaluator(
+      metric_info=InferenceCallCountV1MetricInfoProvider().get_metric_info(),
+      evaluator=_InferenceCallCountV1Evaluator,
+  )
+  metric_evaluator_registry.register_evaluator(
+      metric_info=TokenUsageV1MetricInfoProvider().get_metric_info(),
+      evaluator=_TokenUsageV1Evaluator,
+  )
+  metric_evaluator_registry.register_evaluator(
+      metric_info=InvocationDurationV1MetricInfoProvider().get_metric_info(),
+      evaluator=_InvocationDurationV1Evaluator,
   )
 
 

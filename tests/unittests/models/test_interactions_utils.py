@@ -22,6 +22,7 @@ from datetime import datetime
 from datetime import timezone
 import json
 import logging
+import typing
 from unittest.mock import MagicMock
 
 from google.adk.models import interactions_utils
@@ -43,6 +44,7 @@ from google.genai.interactions import StepStart
 from google.genai.interactions import StepStop
 from google.genai.interactions import TextContent
 from google.genai.interactions import ThoughtStep
+from google.genai.interactions import UnknownStepDeltaData
 from google.genai.interactions import Usage
 import pytest
 
@@ -78,16 +80,39 @@ class _FakeInteractions:
       events: list[object] | None = None,
       *,
       interaction: Interaction | None = None,
+      poll_results: list[Interaction] | None = None,
   ):
     self._events = events or []
     self._interaction = interaction
+    self._poll_results = list(poll_results or [])
     self.create_calls: list[dict[str, object]] = []
+    self.get_calls: list[dict[str, object]] = []
 
   async def create(self, **kwargs):
     self.create_calls.append(kwargs)
     if kwargs.get('stream'):
       return _MockAsyncIterator(self._events)
     return self._interaction
+
+  async def get(self, interaction_id, **kwargs):
+    """Return the next configured poll result.
+
+    ``_wait_for_interaction`` re-reads a pending interaction until it reports a
+    final status, so tests supply one Interaction per expected poll.
+
+    Args:
+      interaction_id: The id being re-read, recorded for assertions.
+      **kwargs: Remaining get() kwargs, also recorded for assertions.
+
+    Returns:
+      The next Interaction from the configured poll results.
+    """
+    self.get_calls.append({'id': interaction_id, **kwargs})
+    result = self._poll_results.pop(0)
+    # An entry may be an exception, standing in for a failed read.
+    if isinstance(result, Exception):
+      raise result
+    return result
 
 
 class _FakeAio:
@@ -98,8 +123,11 @@ class _FakeAio:
       events: list[object] | None = None,
       *,
       interaction: Interaction | None = None,
+      poll_results: list[Interaction] | None = None,
   ):
-    self.interactions = _FakeInteractions(events, interaction=interaction)
+    self.interactions = _FakeInteractions(
+        events, interaction=interaction, poll_results=poll_results
+    )
 
 
 class _FakeApiClient:
@@ -115,12 +143,19 @@ class _FakeApiClient:
       events: list[object] | None = None,
       *,
       interaction: Interaction | None = None,
+      poll_results: list[Interaction] | None = None,
   ):
-    self.aio = _FakeAio(events, interaction=interaction)
+    self.aio = _FakeAio(
+        events, interaction=interaction, poll_results=poll_results
+    )
 
   @property
   def create_calls(self) -> list[dict[str, object]]:
     return self.aio.interactions.create_calls
+
+  @property
+  def get_calls(self) -> list[dict[str, object]]:
+    return self.aio.interactions.get_calls
 
 
 def _build_llm_request() -> LlmRequest:
@@ -598,6 +633,172 @@ class TestConvertPartToInteractionContent:
     assert result is None
 
 
+@pytest.mark.filterwarnings('ignore::DeprecationWarning')
+class TestDeprecatedConvertPartToInteractionContent:
+  """Tests for the deprecated public convert_part_to_interaction_content.
+
+  Unlike the private converter this one returns a bare content dict (it does
+  not wrap anything in a step) and it keeps the thought signature, so its
+  output shape has to be pinned separately.
+  """
+
+  def test_empty_text_is_kept_as_a_text_content(self):
+    """An empty string is a text part, not an unsupported part."""
+    result = interactions_utils.convert_part_to_interaction_content(
+        types.Part(text='')
+    )
+    assert result == {'type': 'text', 'text': ''}
+
+  def test_whitespace_only_text_is_not_stripped(self):
+    """Whitespace is content; the converter must not normalize it away."""
+    result = interactions_utils.convert_part_to_interaction_content(
+        types.Part(text='   \n')
+    )
+    assert result == {'type': 'text', 'text': '   \n'}
+
+  def test_function_call_defaults_missing_id_and_args(self):
+    """A call with no id/args still needs both keys for the API payload."""
+    part = types.Part(
+        function_call=types.FunctionCall(name='get_weather'),
+    )
+    result = interactions_utils.convert_part_to_interaction_content(part)
+    assert result == {
+        'type': 'function_call',
+        'id': '',
+        'name': 'get_weather',
+        'arguments': {},
+    }
+
+  def test_function_call_base64_encodes_thought_signature(self):
+    """Signature bytes have to be base64 to survive a JSON payload."""
+    part = types.Part(
+        function_call=types.FunctionCall(
+            id='call_1', name='get_weather', args={'city': 'London'}
+        ),
+        thought_signature=b'sig',
+    )
+    result = interactions_utils.convert_part_to_interaction_content(part)
+    assert result == {
+        'type': 'function_call',
+        'id': 'call_1',
+        'name': 'get_weather',
+        'arguments': {'city': 'London'},
+        # base64 of b'sig'.
+        'thought_signature': 'c2ln',
+    }
+
+  def test_function_response_passes_structured_result_through_unserialized(
+      self,
+  ):
+    """Pre-serializing here would double-escape once the API encodes it."""
+    part = types.Part(
+        function_response=types.FunctionResponse(
+            id='call_1',
+            name='get_weather',
+            response={'temp': 15, 'tags': ['warm', 'dry']},
+        )
+    )
+    result = interactions_utils.convert_part_to_interaction_content(part)
+    assert result == {
+        'type': 'function_result',
+        'name': 'get_weather',
+        'call_id': 'call_1',
+        'result': {'temp': 15, 'tags': ['warm', 'dry']},
+    }
+
+  def test_function_response_defaults_missing_name_and_call_id(self):
+    """Both keys are required by the API even when the part omits them."""
+    part = types.Part(
+        function_response=types.FunctionResponse(response={'ok': True})
+    )
+    result = interactions_utils.convert_part_to_interaction_content(part)
+    assert result['name'] == ''
+    assert result['call_id'] == ''
+    assert result['result'] == {'ok': True}
+
+  @pytest.mark.parametrize(
+      'mime_type,expected_type',
+      [
+          ('image/png', 'image'),
+          ('audio/mp3', 'audio'),
+          ('video/mp4', 'video'),
+          ('application/pdf', 'document'),
+          ('text/csv', 'document'),
+      ],
+  )
+  def test_inline_data_routes_on_mime_type_prefix(
+      self, mime_type, expected_type
+  ):
+    """Anything that is not image/audio/video falls back to document."""
+    part = types.Part(
+        inline_data=types.Blob(mime_type=mime_type, data=b'\x00\x01')
+    )
+    result = interactions_utils.convert_part_to_interaction_content(part)
+    assert result['type'] == expected_type
+    assert result['mime_type'] == mime_type
+
+  @pytest.mark.parametrize(
+      'mime_type,expected_type',
+      [
+          ('image/png', 'image'),
+          ('audio/mp3', 'audio'),
+          ('video/mp4', 'video'),
+          ('application/pdf', 'document'),
+      ],
+  )
+  def test_file_data_routes_on_mime_type_and_carries_uri(
+      self, mime_type, expected_type
+  ):
+    """File parts reference the payload by uri instead of inlining it."""
+    part = types.Part(
+        file_data=types.FileData(
+            mime_type=mime_type, file_uri='https://example.com/a'
+        )
+    )
+    result = interactions_utils.convert_part_to_interaction_content(part)
+    assert result == {
+        'type': expected_type,
+        'uri': 'https://example.com/a',
+        'mime_type': mime_type,
+    }
+
+  @pytest.mark.parametrize(
+      'outcome,expected_is_error',
+      [
+          (types.Outcome.OUTCOME_OK, False),
+          (types.Outcome.OUTCOME_FAILED, True),
+          (types.Outcome.OUTCOME_DEADLINE_EXCEEDED, True),
+      ],
+  )
+  def test_code_execution_result_marks_failures_as_errors(
+      self, outcome, expected_is_error
+  ):
+    """Only a successful outcome is reported to the API as a non-error."""
+    part = types.Part(
+        code_execution_result=types.CodeExecutionResult(
+            outcome=outcome, output='7'
+        )
+    )
+    result = interactions_utils.convert_part_to_interaction_content(part)
+    assert result['type'] == 'code_execution_result'
+    assert result['result'] == '7'
+    assert result['is_error'] is expected_is_error
+
+  def test_thought_part_only_carries_base64_signature(self):
+    """A thought part has no plaintext; only the signature round-trips."""
+    part = types.Part(thought=True, thought_signature=b'sig')
+    result = interactions_utils.convert_part_to_interaction_content(part)
+    # base64 of b'sig'.
+    assert result == {'type': 'thought', 'signature': 'c2ln'}
+
+  def test_unsupported_part_returns_none(self):
+    """An empty part has nothing to send, so the caller must skip it."""
+    assert (
+        interactions_utils.convert_part_to_interaction_content(types.Part())
+        is None
+    )
+
+
 class TestConvertContentToStep:
   """Tests for _convert_content_to_step."""
 
@@ -928,11 +1129,56 @@ class TestConvertInteractionOutputToParts:
     assert result.code_execution_result.output == 'Error: division by zero'
     assert result.code_execution_result.outcome == types.Outcome.OUTCOME_FAILED
 
-  def test_thought_output_returns_empty(self):
-    """Test that thought output returns empty list (not exposed as Part)."""
-    output = ThoughtStep(type='thought', signature='thinking...')
+  def test_thought_output_without_signature_returns_empty(self):
+    """A thought step with no signature contributes no parts."""
+    output = ThoughtStep(type='thought')
     result = interactions_utils._convert_interaction_step_to_parts(output)
     assert result == []
+
+  def test_thought_output_with_signature_becomes_thought_part(self):
+    """A thought step's signature is decoded onto a thought part."""
+    output = ThoughtStep(
+        type='thought',
+        signature=base64.b64encode(b'sig-bytes').decode('utf-8'),
+    )
+
+    result = interactions_utils._convert_interaction_step_to_parts(output)
+
+    assert len(result) == 1
+    assert result[0].thought is True
+    assert result[0].thought_signature == b'sig-bytes'
+
+  def test_thought_output_signature_survives_the_round_trip_back(self):
+    """The signature part re-encodes as a thought step carrying the signature.
+
+    Gemini 3 only accepts the follow-up request if the signature comes back
+    verbatim, so the part has to convert back to a step that still has one.
+    """
+    signature = base64.b64encode(b'sig-bytes').decode('utf-8')
+    output = ThoughtStep(type='thought', signature=signature)
+
+    part = interactions_utils._convert_interaction_step_to_parts(output)[0]
+
+    assert interactions_utils._convert_part_to_interaction_content(part) == {
+        'type': 'thought',
+        'signature': signature,
+    }
+
+  def test_thought_output_summary_is_not_carried_onto_the_part(self):
+    """The signature part stays text-free.
+
+    A part that also carries text converts back to a text step, which has no
+    signature field, so the signature would be dropped on the next request.
+    """
+    output = ThoughtStep(
+        type='thought',
+        signature=base64.b64encode(b'sig-bytes').decode('utf-8'),
+        summary=[TextContent(type='text', text='Let me think...')],
+    )
+
+    result = interactions_utils._convert_interaction_step_to_parts(output)
+
+    assert result[0].text is None
 
   def test_no_type_attribute(self):
     """Test handling output without type attribute."""
@@ -987,6 +1233,54 @@ class TestConvertInteractionToLlmResponse:
     assert result.finish_reason == types.FinishReason.STOP
     assert result.turn_complete is True
 
+  def test_uses_reported_total_token_count(self):
+    """Total token count comes from the API, not from input + output."""
+    interaction = Interaction(
+        id='interaction_123',
+        status='completed',
+        created=datetime.now(timezone.utc).isoformat(),
+        updated=datetime.now(timezone.utc).isoformat(),
+        steps=[
+            ModelOutputStep(
+                type='model_output',
+                content=[TextContent(type='text', text='The answer is 4.')],
+            )
+        ],
+        # Thought and tool-use tokens are billed but are not part of input +
+        # output, so the sum (15) undercounts the real total.
+        usage=Usage(
+            total_input_tokens=10,
+            total_output_tokens=5,
+            total_thought_tokens=6,
+            total_tool_use_tokens=2,
+            total_tokens=23,
+        ),
+    )
+    result = interactions_utils.convert_interaction_to_llm_response(interaction)
+
+    assert result.usage_metadata.prompt_token_count == 10
+    assert result.usage_metadata.candidates_token_count == 5
+    assert result.usage_metadata.total_token_count == 23
+
+  def test_total_token_count_falls_back_to_sum_when_absent(self):
+    """When the API omits the total, fall back to input + output."""
+    interaction = Interaction(
+        id='interaction_123',
+        status='completed',
+        created=datetime.now(timezone.utc).isoformat(),
+        updated=datetime.now(timezone.utc).isoformat(),
+        steps=[
+            ModelOutputStep(
+                type='model_output',
+                content=[TextContent(type='text', text='The answer is 4.')],
+            )
+        ],
+        usage=Usage(total_input_tokens=10, total_output_tokens=5),
+    )
+    result = interactions_utils.convert_interaction_to_llm_response(interaction)
+
+    assert result.usage_metadata.total_token_count == 15
+
   def test_failed_response(self):
     """Test converting a failed response."""
     interaction = Interaction(
@@ -1031,8 +1325,15 @@ class TestConvertInteractionToLlmResponse:
 class TestBuildGenerationConfig:
   """Tests for build_generation_config."""
 
+  @pytest.fixture(autouse=True)
+  def _forget_warned_parameters(self):
+    """Each test starts with nothing warned about yet."""
+    interactions_utils._WARNED_SAMPLING_PARAMS.clear()
+    yield
+    interactions_utils._WARNED_SAMPLING_PARAMS.clear()
+
   def test_all_parameters(self):
-    """Test building config with all parameters."""
+    """Test that only parameters that reach the interactions API are sent."""
     config = types.GenerateContentConfig(
         temperature=0.7,
         top_p=0.9,
@@ -1041,16 +1342,13 @@ class TestBuildGenerationConfig:
         stop_sequences=['END'],
         presence_penalty=0.5,
         frequency_penalty=0.3,
+        seed=7,
     )
     result = interactions_utils.build_generation_config(config)
     assert result == {
-        'temperature': 0.7,
-        'top_p': 0.9,
-        'top_k': 40,
         'max_output_tokens': 100,
         'stop_sequences': ['END'],
-        'presence_penalty': 0.5,
-        'frequency_penalty': 0.3,
+        'seed': 7,
     }
 
   def test_partial_parameters(self):
@@ -1060,16 +1358,119 @@ class TestBuildGenerationConfig:
         max_output_tokens=50,
     )
     result = interactions_utils.build_generation_config(config)
-    assert result == {
-        'temperature': 0.5,
-        'max_output_tokens': 50,
-    }
+    assert result == {'max_output_tokens': 50}
 
   def test_empty_config(self):
     """Test building config with no parameters."""
     config = types.GenerateContentConfig()
     result = interactions_utils.build_generation_config(config)
     assert result == {}
+
+  def test_every_key_is_a_real_generation_config_field(self):
+    """Keys absent from GenerationConfigParam are dropped before the wire."""
+    config = types.GenerateContentConfig(
+        temperature=0.7,
+        top_p=0.9,
+        top_k=40,
+        max_output_tokens=100,
+        stop_sequences=['END'],
+        presence_penalty=0.5,
+        frequency_penalty=0.3,
+        seed=7,
+    )
+    result = interactions_utils.build_generation_config(config)
+    supported = set(typing.get_type_hints(interactions.GenerationConfigParam))
+    assert set(result) == {'max_output_tokens', 'stop_sequences', 'seed'}
+    assert set(result) <= supported
+
+  def test_dropped_parameters_are_the_ones_the_request_cannot_carry(self):
+    """The parameters left out are exactly those with no request field."""
+    dropped = set(interactions_utils._UNDECLARED_SAMPLING_PARAMS) | set(
+        interactions_utils._UNSUPPORTED_SAMPLING_PARAMS
+    )
+    supported = set(typing.get_type_hints(interactions.GenerationConfigParam))
+    assert dropped.isdisjoint(supported)
+
+  def test_undeclared_parameters_point_at_the_client(self, caplog):
+    """A parameter the API applies but the client cannot send blames genai."""
+    config = types.GenerateContentConfig(temperature=0.7, top_p=0.9, top_k=40)
+
+    with caplog.at_level(
+        logging.WARNING, logger=interactions_utils.logger.name
+    ):
+      interactions_utils.build_generation_config(config)
+
+    warnings = [
+        r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert 'temperature' in warnings[0]
+    assert 'top_p' in warnings[0]
+    assert 'top_k' in warnings[0]
+    assert 'google-genai' in warnings[0]
+    assert 'use_interactions_api' not in warnings[0]
+
+  def test_unsupported_parameters_point_at_the_api(self, caplog):
+    """A parameter the API rejects tells the caller to unset it instead."""
+    config = types.GenerateContentConfig(
+        presence_penalty=0.5, frequency_penalty=0.3
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger=interactions_utils.logger.name
+    ):
+      interactions_utils.build_generation_config(config)
+
+    warnings = [
+        r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert 'presence_penalty' in warnings[0]
+    assert 'frequency_penalty' in warnings[0]
+    assert 'use_interactions_api' in warnings[0]
+
+  def test_the_two_causes_are_reported_separately(self, caplog):
+    """Test that one cause is not folded into the other's remedy."""
+    config = types.GenerateContentConfig(temperature=0.7, presence_penalty=0.5)
+
+    with caplog.at_level(
+        logging.WARNING, logger=interactions_utils.logger.name
+    ):
+      interactions_utils.build_generation_config(config)
+
+    warnings = [
+        r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 2
+    client, api = sorted(warnings, key=lambda w: 'use_interactions_api' in w)
+    assert 'temperature' in client and 'presence_penalty' not in client
+    assert 'presence_penalty' in api and 'temperature' not in api
+
+  def test_dropped_parameters_are_logged_once(self, caplog):
+    """Test that a parameter is reported once, not on every model turn."""
+    config = types.GenerateContentConfig(temperature=0.7)
+
+    with caplog.at_level(
+        logging.WARNING, logger=interactions_utils.logger.name
+    ):
+      interactions_utils.build_generation_config(config)
+      interactions_utils.build_generation_config(config)
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+
+  def test_supported_parameters_only_do_not_warn(self, caplog):
+    """Test that a config the API can honor logs nothing."""
+    config = types.GenerateContentConfig(
+        max_output_tokens=100, stop_sequences=['END'], seed=7
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger=interactions_utils.logger.name
+    ):
+      interactions_utils.build_generation_config(config)
+
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 class TestExtractSystemInstruction:
@@ -1208,6 +1609,93 @@ class TestGetLatestUserContents:
     assert result[0].parts[0].text == 'Great'
     assert result[1].parts[0].text == 'Tell me more'
 
+  def test_signature_from_preceding_model_turn_is_carried_over(self):
+    """A tool call's thought signature leads the returned contents.
+
+    The signature sits on the model turn that requested the tool call, one
+    step outside the trailing user window, but Gemini 3 rejects the request
+    that carries the tool result unless the signature comes back with it.
+    """
+    contents = [
+        types.Content(role='user', parts=[types.Part(text='Weather?')]),
+        types.Content(
+            role='model',
+            parts=[
+                types.Part(
+                    function_call=types.FunctionCall(name='get_weather'),
+                    thought_signature=b'sig-bytes',
+                )
+            ],
+        ),
+        types.Content(
+            role='user',
+            parts=[
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name='get_weather', response={'temp': 20}
+                    )
+                )
+            ],
+        ),
+    ]
+
+    result = interactions_utils._get_latest_user_contents(contents)
+
+    assert len(result) == 2
+    assert result[0].role == 'model'
+    assert result[0].parts[0].thought_signature == b'sig-bytes'
+    assert result[1].role == 'user'
+
+  def test_signature_free_parts_of_that_turn_are_left_behind(self):
+    """Only the signature-bearing parts of the model turn come across.
+
+    The rest of that turn is already server-side under
+    previous_interaction_id, so re-sending it would duplicate it.
+    """
+    contents = [
+        types.Content(
+            role='model',
+            parts=[
+                types.Part(text='Let me check the forecast.'),
+                types.Part(thought=True, thought_signature=b'sig-bytes'),
+            ],
+        ),
+        types.Content(role='user', parts=[types.Part(text='Thanks')]),
+    ]
+
+    result = interactions_utils._get_latest_user_contents(contents)
+
+    assert len(result[0].parts) == 1
+    assert result[0].parts[0].thought_signature == b'sig-bytes'
+
+  def test_signature_carried_across_several_trailing_user_messages(self):
+    """The signature part stays ahead of every message in the user window."""
+    contents = [
+        types.Content(
+            role='model',
+            parts=[types.Part(thought=True, thought_signature=b'sig-bytes')],
+        ),
+        types.Content(role='user', parts=[types.Part(text='First')]),
+        types.Content(role='user', parts=[types.Part(text='Second')]),
+    ]
+
+    result = interactions_utils._get_latest_user_contents(contents)
+
+    assert [content.role for content in result] == ['model', 'user', 'user']
+    assert result[0].parts[0].thought_signature == b'sig-bytes'
+
+  def test_partless_preceding_model_turn_is_skipped(self):
+    """A model turn with no parts contributes nothing and does not raise."""
+    contents = [
+        types.Content(role='model'),
+        types.Content(role='user', parts=[types.Part(text='Hello')]),
+    ]
+
+    result = interactions_utils._get_latest_user_contents(contents)
+
+    assert len(result) == 1
+    assert result[0].parts[0].text == 'Hello'
+
 
 class TestConvertInteractionEventToLlmResponse:
   """Tests for convert_interaction_event_to_llm_response."""
@@ -1272,6 +1760,27 @@ class TestConvertInteractionEventToLlmResponse:
     assert part.thought is True
     assert len(state.parts) == 1
 
+  def test_thought_summary_delta_ignores_non_text_content(self):
+    """A thought summary carrying non-text content emits nothing."""
+    event = StepDelta(
+        event_type='step.delta',
+        index=0,
+        delta={
+            'type': 'thought_summary',
+            'content': {
+                'type': 'image',
+                'data': 'aW1n',
+                'mime_type': 'image/png',
+            },
+        },
+    )
+    state = interactions_utils._StreamState()
+    result = interactions_utils.convert_interaction_event_to_llm_response(
+        event, state, interaction_id='int_t'
+    )
+    assert result is None
+    assert state.parts == []
+
   def test_thought_signature_delta_attaches_to_last_thought(self):
     """thought_signature mutates the last thought part and emits no event."""
     state = interactions_utils._StreamState()
@@ -1299,6 +1808,79 @@ class TestConvertInteractionEventToLlmResponse:
     )
     assert result is None
     assert state.parts[-1].thought_signature == b'sig-bytes'
+
+  def test_thought_signature_delta_alone_becomes_its_own_part(self):
+    """A signature with no preceding thought summary still reaches the stream.
+
+    The model routinely emits a signature without a summary, and dropping it
+    would make the next request fail.
+    """
+    state = interactions_utils._StreamState()
+
+    result = interactions_utils.convert_interaction_event_to_llm_response(
+        StepDelta(
+            event_type='step.delta',
+            index=0,
+            delta={
+                'type': 'thought_signature',
+                'signature': base64.b64encode(b'lone-sig').decode('utf-8'),
+            },
+        ),
+        state,
+        interaction_id='int_ts',
+    )
+
+    assert result is None
+    assert len(state.parts) == 1
+    assert state.parts[0].thought is True
+    assert state.parts[0].thought_signature == b'lone-sig'
+
+  def test_thought_signature_delta_does_not_attach_to_a_text_part(self):
+    """A signature never lands on a text part, which cannot carry one."""
+    state = interactions_utils._StreamState()
+    interactions_utils.convert_interaction_event_to_llm_response(
+        StepDelta(
+            event_type='step.delta',
+            index=0,
+            delta={'type': 'text', 'text': 'The weather is sunny.'},
+        ),
+        state,
+        interaction_id='int_ts',
+    )
+
+    interactions_utils.convert_interaction_event_to_llm_response(
+        StepDelta(
+            event_type='step.delta',
+            index=0,
+            delta={
+                'type': 'thought_signature',
+                'signature': base64.b64encode(b'sig-bytes').decode('utf-8'),
+            },
+        ),
+        state,
+        interaction_id='int_ts',
+    )
+
+    assert state.parts[0].text == 'The weather is sunny.'
+    assert state.parts[0].thought_signature is None
+    assert state.parts[1].thought_signature == b'sig-bytes'
+
+  def test_thought_signature_delta_without_signature_adds_no_part(self):
+    """An empty signature delta leaves the stream state untouched."""
+    state = interactions_utils._StreamState()
+
+    result = interactions_utils.convert_interaction_event_to_llm_response(
+        StepDelta(
+            event_type='step.delta',
+            index=0,
+            delta={'type': 'thought_signature', 'signature': ''},
+        ),
+        state,
+        interaction_id='int_ts',
+    )
+
+    assert result is None
+    assert state.parts == []
 
   def test_audio_delta_with_data(self):
     """audio delta becomes an inline_data part via the shared media handler."""
@@ -1462,6 +2044,27 @@ class TestConvertInteractionEventToLlmResponse:
     assert len(state.grounding_chunks) == 1
     assert len(state.grounding_supports) == 1
 
+  def test_text_annotation_delta_skips_non_url_citations(self):
+    """Annotations that are not url_citations contribute no grounding."""
+    event = StepDelta(
+        event_type='step.delta',
+        index=0,
+        delta={
+            'type': 'text_annotation_delta',
+            'annotations': [
+                {'type': 'file_citation', 'file_id': 'f1'},
+                {'type': 'word_info', 'word': 'hello'},
+            ],
+        },
+    )
+    state = interactions_utils._StreamState()
+    result = interactions_utils.convert_interaction_event_to_llm_response(
+        event, state, interaction_id='int_an'
+    )
+    assert result is None
+    assert state.grounding_chunks == []
+    assert state.grounding_supports == []
+
   def test_function_result_delta(self):
     """function_result delta becomes a function_response part."""
     event = StepDelta(
@@ -1593,6 +2196,46 @@ class TestConvertInteractionEventToLlmResponse:
     assert final.usage_metadata.candidates_token_count == 7
     assert final.usage_metadata.total_token_count == 19
 
+  def test_final_event_uses_reported_total_token_count(self):
+    """The final event reports the API total, not input + output."""
+    state = interactions_utils._StreamState()
+    conv = interactions_utils.convert_interaction_event_to_llm_response
+    conv(
+        StepDelta(
+            event_type='step.delta',
+            index=0,
+            delta={'type': 'text', 'text': 'Answer.'},
+        ),
+        state,
+        interaction_id='int_u3',
+    )
+    final = conv(
+        InteractionCompletedEvent(
+            event_type='interaction.completed',
+            interaction=InteractionSseEventInteraction(
+                id='int_u3',
+                status='completed',
+                steps=[],
+                # Thought and tool-use tokens are billed but are not part of
+                # input + output, so the sum (19) undercounts the real total.
+                usage=Usage(
+                    total_input_tokens=12,
+                    total_output_tokens=7,
+                    total_thought_tokens=8,
+                    total_tool_use_tokens=3,
+                    total_tokens=30,
+                ),
+            ),
+        ),
+        state,
+        interaction_id='int_u3',
+    )
+    assert final is not None
+    assert final.usage_metadata is not None
+    assert final.usage_metadata.prompt_token_count == 12
+    assert final.usage_metadata.candidates_token_count == 7
+    assert final.usage_metadata.total_token_count == 30
+
   def test_final_event_without_usage_has_no_usage_metadata(self):
     """No interaction.usage -> final event has usage_metadata None."""
     state = interactions_utils._StreamState()
@@ -1650,7 +2293,9 @@ class TestConvertInteractionEventToLlmResponse:
     event = StepDelta(
         event_type='step.delta',
         index=0,
-        delta={'type': 'totally_made_up_xyz', 'foo': 'bar'},
+        delta=UnknownStepDeltaData(
+            raw={'type': 'totally_made_up_xyz', 'foo': 'bar'}
+        ),
     )
     state = interactions_utils._StreamState()
     with caplog.at_level(
@@ -1819,6 +2464,260 @@ class TestConvertInteractionEventToLlmResponse:
 
     # The logging check can remain to ensure the raw exception is still logged.
     assert 'Failed to parse function call args' in caplog.text
+
+  def test_interleaved_function_call_streaming_routes_by_index(self):
+    """Interleaved function-call steps route deltas/stops by their index.
+
+    Two calls start at indexes 0 and 1, then arguments for both arrive before
+    either stops. Without index-based routing, both deltas would be appended to
+    the most recently started call (index 1), so the first call ends up with no
+    arguments while the second receives two concatenated JSON objects.
+    """
+    state = interactions_utils._StreamState()
+
+    # Start two function calls at different indexes.
+    for idx, (call_id, name) in enumerate(
+        [('call_0', 'get_weather'), ('call_1', 'get_time')]
+    ):
+      interactions_utils.convert_interaction_event_to_llm_response(
+          StepStart(
+              event_type='step.start',
+              index=idx,
+              step=FunctionCallStep(
+                  type='function_call', id=call_id, name=name, arguments={}
+              ),
+          ),
+          state,
+          interaction_id='int_multi',
+      )
+
+    # Interleave argument deltas: index 0 first, then index 1.
+    interactions_utils.convert_interaction_event_to_llm_response(
+        StepDelta(
+            event_type='step.delta',
+            index=0,
+            delta={'type': 'arguments_delta', 'arguments': '{"city": "Paris"}'},
+        ),
+        state,
+        interaction_id='int_multi',
+    )
+    interactions_utils.convert_interaction_event_to_llm_response(
+        StepDelta(
+            event_type='step.delta',
+            index=1,
+            delta={'type': 'arguments_delta', 'arguments': '{"zone": "UTC"}'},
+        ),
+        state,
+        interaction_id='int_multi',
+    )
+
+    # Stop both steps.
+    for idx in (0, 1):
+      interactions_utils.convert_interaction_event_to_llm_response(
+          StepStop(event_type='step.stop', index=idx),
+          state,
+          interaction_id='int_multi',
+      )
+
+    assert state.parts[0].function_call.name == 'get_weather'
+    assert state.parts[0].function_call.args == {'city': 'Paris'}
+    assert state.parts[1].function_call.name == 'get_time'
+    assert state.parts[1].function_call.args == {'zone': 'UTC'}
+
+  def test_step_stop_with_unmatched_index_does_not_finalize_active_function_call(
+      self,
+  ):
+    """An event with an unmatched step index must not resolve to the last function call."""
+    state = interactions_utils._StreamState()
+
+    interactions_utils.convert_interaction_event_to_llm_response(
+        StepStart(
+            event_type='step.start',
+            index=0,
+            step=FunctionCallStep(
+                type='function_call',
+                id='call_0',
+                name='get_weather',
+                arguments={},
+            ),
+        ),
+        state,
+        interaction_id='int_multi',
+    )
+
+    interactions_utils.convert_interaction_event_to_llm_response(
+        StepDelta(
+            event_type='step.delta',
+            index=0,
+            delta={'type': 'arguments_delta', 'arguments': '{"city": '},
+        ),
+        state,
+        interaction_id='int_multi',
+    )
+
+    # StepStop for an unrelated step (index 1). It must not finalize step 0's call.
+    res = interactions_utils.convert_interaction_event_to_llm_response(
+        StepStop(event_type='step.stop', index=1),
+        state,
+        interaction_id='int_multi',
+    )
+    assert res is None
+
+    # Step 0 receives the rest of its arguments and stops cleanly.
+    interactions_utils.convert_interaction_event_to_llm_response(
+        StepDelta(
+            event_type='step.delta',
+            index=0,
+            delta={'type': 'arguments_delta', 'arguments': '"Paris"}'},
+        ),
+        state,
+        interaction_id='int_multi',
+    )
+    interactions_utils.convert_interaction_event_to_llm_response(
+        StepStop(event_type='step.stop', index=0),
+        state,
+        interaction_id='int_multi',
+    )
+
+    assert state.parts[0].function_call.name == 'get_weather'
+    assert state.parts[0].function_call.args == {'city': 'Paris'}
+
+  def test_arguments_delta_with_unmatched_index_does_not_alter_active_function_call(
+      self, caplog
+  ):
+    """An arguments delta with an unmatched step index must not resolve to an active function call."""
+    state = interactions_utils._StreamState()
+
+    interactions_utils.convert_interaction_event_to_llm_response(
+        StepStart(
+            event_type='step.start',
+            index=0,
+            step=FunctionCallStep(
+                type='function_call',
+                id='call_0',
+                name='get_weather',
+                arguments={},
+            ),
+        ),
+        state,
+        interaction_id='int_multi',
+    )
+
+    interactions_utils.convert_interaction_event_to_llm_response(
+        StepDelta(
+            event_type='step.delta',
+            index=0,
+            delta={'type': 'arguments_delta', 'arguments': '{"city": '},
+        ),
+        state,
+        interaction_id='int_multi',
+    )
+
+    # ArgumentsDelta for an unrelated step (index 1). It must return None, log a
+    # warning, and not be appended to step 0's call.
+    with caplog.at_level(logging.WARNING):
+      res = interactions_utils.convert_interaction_event_to_llm_response(
+          StepDelta(
+              event_type='step.delta',
+              index=1,
+              delta={'type': 'arguments_delta', 'arguments': '{"extra": 1}'},
+          ),
+          state,
+          interaction_id='int_multi',
+      )
+    assert res is None
+    assert (
+        'Interactions streaming converter dropped an arguments delta: step'
+        ' index 1 has no function-call part; skipping.'
+        in caplog.text
+    )
+
+    # Step 0 receives the rest of its arguments and stops cleanly.
+    interactions_utils.convert_interaction_event_to_llm_response(
+        StepDelta(
+            event_type='step.delta',
+            index=0,
+            delta={'type': 'arguments_delta', 'arguments': '"Paris"}'},
+        ),
+        state,
+        interaction_id='int_multi',
+    )
+    interactions_utils.convert_interaction_event_to_llm_response(
+        StepStop(event_type='step.stop', index=0),
+        state,
+        interaction_id='int_multi',
+    )
+
+    assert state.parts[0].function_call.name == 'get_weather'
+    assert state.parts[0].function_call.args == {'city': 'Paris'}
+
+  def test_arguments_delta_for_finalized_call_logs_warning(self, caplog):
+    """An arguments delta arriving after StepStop must log a warning and return None."""
+    state = interactions_utils._StreamState()
+
+    interactions_utils.convert_interaction_event_to_llm_response(
+        StepStart(
+            event_type='step.start',
+            index=0,
+            step=FunctionCallStep(
+                type='function_call',
+                id='call_0',
+                name='get_weather',
+                arguments={},
+            ),
+        ),
+        state,
+        interaction_id='int_multi',
+    )
+    interactions_utils.convert_interaction_event_to_llm_response(
+        StepDelta(
+            event_type='step.delta',
+            index=0,
+            delta={'type': 'arguments_delta', 'arguments': '{"city": "Paris"}'},
+        ),
+        state,
+        interaction_id='int_multi',
+    )
+    interactions_utils.convert_interaction_event_to_llm_response(
+        StepStop(event_type='step.stop', index=0),
+        state,
+        interaction_id='int_multi',
+    )
+    assert state.parts[0].function_call.partial_args is None
+    assert state.parts[0].function_call.args == {'city': 'Paris'}
+
+    # A routine delta with None arguments should be a silent no-op.
+    with caplog.at_level(logging.WARNING):
+      res_none = interactions_utils.convert_interaction_event_to_llm_response(
+          StepDelta(
+              event_type='step.delta',
+              index=0,
+              delta={'type': 'arguments_delta', 'arguments': None},
+          ),
+          state,
+          interaction_id='int_multi',
+      )
+    assert res_none is None
+    assert 'was already finalized' not in caplog.text
+
+    # A late arguments delta for the finalized call must warn and return None.
+    with caplog.at_level(logging.WARNING):
+      res_late = interactions_utils.convert_interaction_event_to_llm_response(
+          StepDelta(
+              event_type='step.delta',
+              index=0,
+              delta={'type': 'arguments_delta', 'arguments': '{"extra": 1}'},
+          ),
+          state,
+          interaction_id='int_multi',
+      )
+    assert res_late is None
+    assert (
+        'Interactions streaming converter dropped an arguments delta: step'
+        ' index 0 was already finalized; skipping.'
+        in caplog.text
+    )
+    assert state.parts[0].function_call.args == {'city': 'Paris'}
 
 
 @pytest.mark.parametrize(
@@ -2040,6 +2939,117 @@ async def test_generate_content_via_interactions_non_streaming_yields_single_res
   assert len(responses) == 1
   assert responses[0].interaction_id == 'interaction_ns'
   assert responses[0].content.parts[0].text == 'Sunny in Tokyo.'
+
+
+class TestServiceTier:
+  """Tests for forwarding a serving tier on the interactions create call.
+
+  ``deferred`` queues the request to run on off-peak capacity rather than
+  being turned away when capacity is tight. The API requires ``background``
+  alongside it, and the queued request returns an id instead of a result.
+  """
+
+  async def test_no_tier_sends_neither_key(self):
+    """An untiered request is unchanged: no tier, no background."""
+    # Arrange.
+    api_client = _FakeApiClient(interaction=_build_non_streaming_interaction())
+
+    # Act.
+    await _drain(
+        interactions_utils.generate_content_via_interactions(
+            api_client, _build_llm_request(), stream=False
+        )
+    )
+
+    # Assert.
+    assert len(api_client.create_calls) == 1
+    assert 'service_tier' not in api_client.create_calls[0]
+    assert 'background' not in api_client.create_calls[0]
+
+  async def test_deferred_sends_tier_and_background(self):
+    """``deferred`` is forwarded together with ``background=True``.
+
+    ``store`` is deliberately left unset: it already defaults on for a
+    background call, and sending ``store=False`` is rejected outright.
+    """
+    # Arrange.
+    api_client = _FakeApiClient(interaction=_build_non_streaming_interaction())
+
+    # Act.
+    await _drain(
+        interactions_utils.generate_content_via_interactions(
+            api_client,
+            _build_llm_request(),
+            stream=False,
+            service_tier='deferred',
+        )
+    )
+
+    # Assert.
+    assert len(api_client.create_calls) == 1
+    call = api_client.create_calls[0]
+    assert call['service_tier'] == 'deferred'
+    assert call['background']
+    assert 'store' not in call
+
+  @pytest.mark.parametrize('tier', ['flex', 'standard', 'priority'])
+  async def test_other_tiers_send_no_background(self, tier):
+    """Only ``deferred`` implies a background call."""
+    # Arrange.
+    api_client = _FakeApiClient(interaction=_build_non_streaming_interaction())
+
+    # Act.
+    await _drain(
+        interactions_utils.generate_content_via_interactions(
+            api_client,
+            _build_llm_request(),
+            stream=False,
+            service_tier=tier,
+        )
+    )
+
+    # Assert.
+    assert len(api_client.create_calls) == 1
+    assert api_client.create_calls[0]['service_tier'] == tier
+    assert 'background' not in api_client.create_calls[0]
+
+  async def test_deferred_with_streaming_raises(self):
+    """Deferred cannot stream: the create returns an id, not a result."""
+    # Arrange.
+    api_client = _FakeApiClient(_build_simple_text_stream())
+
+    # Act / Assert.
+    with pytest.raises(ValueError, match='cannot be used with streaming'):
+      await _drain(
+          interactions_utils.generate_content_via_interactions(
+              api_client,
+              _build_llm_request(),
+              stream=True,
+              service_tier='deferred',
+          )
+      )
+
+    # Assert: rejected before reaching the API.
+    assert not api_client.create_calls
+
+  async def test_other_tiers_may_stream(self):
+    """The streaming guard is specific to deferred."""
+    # Arrange.
+    api_client = _FakeApiClient(_build_simple_text_stream())
+
+    # Act.
+    await _drain(
+        interactions_utils.generate_content_via_interactions(
+            api_client,
+            _build_llm_request(),
+            stream=True,
+            service_tier='flex',
+        )
+    )
+
+    # Assert.
+    assert len(api_client.create_calls) == 1
+    assert api_client.create_calls[0]['service_tier'] == 'flex'
 
 
 def _build_stream_with_environment() -> list[object]:
@@ -2274,3 +3284,518 @@ async def test_generate_content_via_interactions_sends_tracking_headers_without_
   )
 
   assert api_client.create_calls[0]['extra_headers'] == get_tracking_headers()
+
+
+class TestBuildInteractionsRequestLog:
+  """Tests for build_interactions_request_log."""
+
+  def test_echoes_call_parameters_and_marks_absent_sections(self):
+    """With nothing configured every optional section says so explicitly."""
+    log = interactions_utils.build_interactions_request_log(
+        model='gemini-2.5-flash',
+        input_steps=[],
+        system_instruction=None,
+        tools=None,
+        generation_config=None,
+        previous_interaction_id='interaction_prev',
+        stream=True,
+    )
+
+    assert 'Model: gemini-2.5-flash' in log
+    assert 'Stream: True' in log
+    assert 'Previous Interaction ID: interaction_prev' in log
+    assert 'System Instruction:\n(none)' in log
+    assert 'Input Steps:\n(none)' in log
+    assert 'Tools:\n(none)' in log
+
+  def test_renders_system_instruction_and_generation_config(self):
+    """Both are echoed verbatim so a log line reproduces the call."""
+    log = interactions_utils.build_interactions_request_log(
+        model='gemini-2.5-flash',
+        input_steps=[],
+        system_instruction='You are helpful.',
+        tools=None,
+        generation_config={'temperature': 0.5},
+        previous_interaction_id=None,
+        stream=False,
+    )
+
+    assert 'System Instruction:\nYou are helpful.' in log
+    assert json.dumps({'temperature': 0.5}) in log
+
+  def test_short_text_content_is_logged_verbatim(self):
+    """Text under the cap must not be altered."""
+    steps = interactions_utils._convert_contents_to_steps(
+        [types.Content(role='user', parts=[types.Part(text='Hi there')])]
+    )
+
+    log = interactions_utils.build_interactions_request_log(
+        model='m',
+        input_steps=steps,
+        system_instruction=None,
+        tools=None,
+        generation_config=None,
+        previous_interaction_id=None,
+        stream=False,
+    )
+
+    assert 'text: "Hi there"' in log
+
+  def test_long_text_content_is_truncated_to_200_chars(self):
+    """A large prompt must not be dumped into the log in full."""
+    long_text = 'x' * 500
+    steps = interactions_utils._convert_contents_to_steps(
+        [types.Content(role='user', parts=[types.Part(text=long_text)])]
+    )
+
+    log = interactions_utils.build_interactions_request_log(
+        model='m',
+        input_steps=steps,
+        system_instruction=None,
+        tools=None,
+        generation_config=None,
+        previous_interaction_id=None,
+        stream=False,
+    )
+
+    assert 'text: "' + 'x' * 200 + '..."' in log
+    assert 'x' * 201 not in log
+
+  def test_function_tools_are_logged_with_name_params_and_description(self):
+    """A tool line has to identify the tool and its parameter schema."""
+    tools = [{
+        'type': 'function',
+        'name': 'get_weather',
+        'description': 'Looks up the weather.',
+        'parameters': {'type': 'object'},
+    }]
+
+    log = interactions_utils.build_interactions_request_log(
+        model='m',
+        input_steps=[],
+        system_instruction=None,
+        tools=tools,
+        generation_config=None,
+        previous_interaction_id=None,
+        stream=False,
+    )
+
+    assert 'get_weather({"type": "object"}): Looks up the weather.' in log
+
+  def test_non_function_tools_are_logged_by_type(self):
+    """Built-in tools have no name/params, so the type is the whole line."""
+    log = interactions_utils.build_interactions_request_log(
+        model='m',
+        input_steps=[],
+        system_instruction=None,
+        tools=[{'type': 'google_search'}],
+        generation_config=None,
+        previous_interaction_id=None,
+        stream=False,
+    )
+
+    assert 'Tools:\n  google_search\n' in log
+
+
+class TestBuildInteractionsResponseLog:
+  """Tests for build_interactions_response_log."""
+
+  def test_reports_id_status_and_token_usage(self):
+    """These three identify the interaction and what it cost."""
+    interaction = Interaction(
+        id='interaction_1',
+        status='completed',
+        usage=Usage(total_input_tokens=11, total_output_tokens=7),
+    )
+
+    log = interactions_utils.build_interactions_response_log(interaction)
+
+    assert 'Interaction ID: interaction_1' in log
+    assert 'Status: completed' in log
+    assert 'Usage:\ninput_tokens: 11, output_tokens: 7' in log
+
+  def test_missing_usage_and_steps_are_reported_as_none(self):
+    """An empty response still has to produce a readable log."""
+    interaction = Interaction(id='interaction_1', status='queued')
+
+    log = interactions_utils.build_interactions_response_log(interaction)
+
+    assert 'Outputs:\n(none)' in log
+    assert 'Usage:\n(none)' in log
+    assert 'Error:\n(none)' in log
+
+  def test_function_call_step_logs_name_and_arguments(self):
+    """A tool call is the part of a response a reader most needs to see."""
+    interaction = Interaction(
+        id='interaction_1',
+        status='requires_action',
+        steps=[
+            FunctionCallStep(
+                type='function_call',
+                id='call_1',
+                name='get_weather',
+                arguments={'city': 'London'},
+            )
+        ],
+    )
+
+    log = interactions_utils.build_interactions_response_log(interaction)
+
+    assert '  function_call: get_weather({"city": "London"})' in log
+
+
+class TestBuildInteractionsEventLog:
+  """Tests for build_interactions_event_log."""
+
+  def test_text_delta_event_reports_type_and_text(self):
+    """Streaming text deltas are logged with their chunk contents."""
+    event = StepDelta(index=0, delta=interactions.TextDelta(text='Sunny'))
+
+    assert (
+        interactions_utils.build_interactions_event_log(event)
+        == 'Interactions SSE Event: step.delta [text: "Sunny"]'
+    )
+
+  def test_text_delta_event_truncates_long_text_to_100_chars(self):
+    """A single delta must not be able to flood the debug log."""
+    event = StepDelta(index=0, delta=interactions.TextDelta(text='y' * 400))
+
+    log = interactions_utils.build_interactions_event_log(event)
+
+    assert log == (
+        'Interactions SSE Event: step.delta [text: "' + 'y' * 100 + '..."]'
+    )
+
+  def test_non_delta_event_reports_only_its_type(self):
+    """Lifecycle events carry no delta, so the details section is empty."""
+    event = StepStart(
+        index=0,
+        step=ModelOutputStep(
+            type='model_output',
+            content=[TextContent(type='text', text='Sunny')],
+        ),
+    )
+
+    assert (
+        interactions_utils.build_interactions_event_log(event)
+        == 'Interactions SSE Event: step.start []'
+    )
+
+
+def _interaction_with_status(
+    status: str, *, interaction_id: str = 'interaction_pending', text: str = ''
+) -> Interaction:
+  """Build an Interaction carrying ``status`` and optional output text."""
+  now = datetime.now(timezone.utc).isoformat()
+  steps = None
+  if text:
+    steps = [
+        ModelOutputStep(
+            type='model_output',
+            content=[TextContent(type='text', text=text)],
+        )
+    ]
+  return Interaction(
+      id=interaction_id,
+      status=status,
+      created=now,
+      updated=now,
+      steps=steps,
+  )
+
+
+@pytest.fixture(name='recorded_sleeps')
+def _recorded_sleeps(monkeypatch) -> list[float]:
+  """Replace the inter-poll sleep with a recorder.
+
+  The backoff runs to 30s per poll, so tests must never sleep for real. The
+  returned list receives each requested delay in order.
+  """
+  delays: list[float] = []
+
+  async def _fake_sleep(delay):
+    delays.append(delay)
+
+  monkeypatch.setattr(interactions_utils.asyncio, 'sleep', _fake_sleep)
+  return delays
+
+
+class TestWaitForInteraction:
+  """Tests for polling a pending interaction to a final status.
+
+  ``interactions.create`` returns once the work is accepted, not once it is
+  done, so a deferred request comes back pending with no output.
+  ``_wait_for_interaction`` re-reads it until the API reports a final status.
+  """
+
+  async def test_polls_until_final_status(self, recorded_sleeps):
+    """Keeps re-reading while pending and returns the first final read."""
+    # Arrange: two more pending reads, then the answer.
+    del recorded_sleeps
+    api_client = _FakeApiClient(
+        poll_results=[
+            _interaction_with_status('queued'),
+            _interaction_with_status('in_progress'),
+            _interaction_with_status('completed', text='Sunny in Tokyo.'),
+        ]
+    )
+
+    # Act.
+    result = await interactions_utils._wait_for_interaction(
+        api_client, _interaction_with_status('queued')
+    )
+
+    # Assert.
+    assert result.status == 'completed'
+    assert len(api_client.get_calls) == 3
+
+  @pytest.mark.parametrize('status', ['queued', 'in_progress'])
+  async def test_treats_both_pending_statuses_as_pending(
+      self, status, recorded_sleeps
+  ):
+    """Both pending statuses are polled.
+
+    Agent Engine has been observed returning each of these for a deferred
+    create, so treating only ``queued`` as pending would drop the answer.
+    """
+    # Arrange.
+    del recorded_sleeps
+    api_client = _FakeApiClient(
+        poll_results=[_interaction_with_status('completed', text='Done.')]
+    )
+
+    # Act.
+    result = await interactions_utils._wait_for_interaction(
+        api_client, _interaction_with_status(status)
+    )
+
+    # Assert.
+    assert len(api_client.get_calls) == 1
+    assert result.status == 'completed'
+
+  @pytest.mark.parametrize(
+      'status',
+      ['completed', 'failed', 'cancelled', 'incomplete', 'budget_exceeded'],
+  )
+  async def test_does_not_poll_when_already_final(self, status):
+    """Every final status short-circuits the wait."""
+    # Arrange.
+    api_client = _FakeApiClient()
+
+    # Act.
+    result = await interactions_utils._wait_for_interaction(
+        api_client, _interaction_with_status(status)
+    )
+
+    # Assert.
+    assert result.status == status
+    assert not api_client.get_calls
+
+  async def test_does_not_poll_on_requires_action(self):
+    """``requires_action`` is not pending.
+
+    The model has finished and is waiting on tool results that only the caller
+    can supply, so polling would never make progress.
+    """
+    # Arrange.
+    api_client = _FakeApiClient()
+
+    # Act.
+    result = await interactions_utils._wait_for_interaction(
+        api_client, _interaction_with_status('requires_action')
+    )
+
+    # Assert.
+    assert result.status == 'requires_action'
+    assert not api_client.get_calls
+
+  async def test_backs_off_between_polls(self, recorded_sleeps):
+    """Delays double from 5s up to a 30s ceiling."""
+    # Arrange.
+    api_client = _FakeApiClient(
+        poll_results=[_interaction_with_status('queued')] * 5
+        + [_interaction_with_status('completed', text='Done.')]
+    )
+
+    # Act.
+    await interactions_utils._wait_for_interaction(
+        api_client, _interaction_with_status('queued')
+    )
+
+    # Assert.
+    assert recorded_sleeps == [5.0, 10.0, 20.0, 30.0, 30.0, 30.0]
+
+  async def test_cancellation_propagates(self, monkeypatch):
+    """The sleep between polls is a cancellation point.
+
+    There is no client-side deadline, so cancelling the surrounding task is how
+    a caller stops waiting.
+
+    Args:
+      monkeypatch: Used to swap in a sleep that blocks until cancelled, rather
+        than the recorded_sleeps fixture's immediate one.
+    """
+
+    # Arrange: a sleep that blocks until cancelled. This patches the stdlib
+    # asyncio module itself, so the test must not call asyncio.sleep while it
+    # is in place; Event.wait() is used to hand off control instead.
+    entered = asyncio.Event()
+
+    async def _blocking_sleep(delay):
+      del delay
+      entered.set()
+      await asyncio.Event().wait()
+
+    monkeypatch.setattr(interactions_utils.asyncio, 'sleep', _blocking_sleep)
+    api_client = _FakeApiClient(
+        poll_results=[_interaction_with_status('queued')]
+    )
+    task = asyncio.create_task(
+        interactions_utils._wait_for_interaction(
+            api_client, _interaction_with_status('queued')
+        )
+    )
+    await entered.wait()
+
+    # Act.
+    task.cancel()
+
+    # Assert: cancelled during the sleep, before any poll was issued.
+    with pytest.raises(asyncio.CancelledError):
+      await task
+    assert not api_client.get_calls
+
+  async def test_absorbs_a_transient_read_failure(self, recorded_sleeps):
+    """A failed poll must not forfeit work the server already accepted.
+
+    Args:
+      recorded_sleeps: Fixture replacing the inter-poll sleep.
+    """
+    del recorded_sleeps
+    api_client = _FakeApiClient(
+        poll_results=[
+            ConnectionError('blip'),
+            _interaction_with_status('queued'),
+            ConnectionError('another blip'),
+            _interaction_with_status('completed', text='Sunny in Tokyo.'),
+        ]
+    )
+
+    result = await interactions_utils._wait_for_interaction(
+        api_client, _interaction_with_status('queued')
+    )
+
+    assert result.status == 'completed'
+    assert len(api_client.get_calls) == 4
+
+  async def test_gives_up_after_repeated_read_failures(self, recorded_sleeps):
+    """An endpoint that is genuinely down still surfaces.
+
+    Args:
+      recorded_sleeps: Fixture replacing the inter-poll sleep.
+    """
+    del recorded_sleeps
+    api_client = _FakeApiClient(poll_results=[ConnectionError('down')] * 10)
+
+    with pytest.raises(ConnectionError):
+      await interactions_utils._wait_for_interaction(
+          api_client, _interaction_with_status('queued')
+      )
+
+    assert (
+        len(api_client.get_calls)
+        == interactions_utils._POLL_MAX_CONSECUTIVE_ERRORS
+    )
+
+  async def test_error_streak_resets_on_a_good_read(self, recorded_sleeps):
+    """Blips spread across a long wait are tolerated, not accumulated.
+
+    Args:
+      recorded_sleeps: Fixture replacing the inter-poll sleep.
+    """
+    del recorded_sleeps
+    # More total failures than the cap, but never that many in a row.
+    poll_results = []
+    for _ in range(3):
+      poll_results += [ConnectionError('blip')] * 4
+      poll_results.append(_interaction_with_status('queued'))
+    poll_results.append(_interaction_with_status('completed', text='Done.'))
+    api_client = _FakeApiClient(poll_results=poll_results)
+
+    result = await interactions_utils._wait_for_interaction(
+        api_client, _interaction_with_status('queued')
+    )
+
+    assert result.status == 'completed'
+
+  async def test_forwards_extra_headers_to_each_poll(self, recorded_sleeps):
+    """Per-request headers ride along on the polls, not just the create."""
+    # Arrange.
+    del recorded_sleeps
+    api_client = _FakeApiClient(
+        poll_results=[
+            _interaction_with_status('queued'),
+            _interaction_with_status('completed', text='Done.'),
+        ]
+    )
+
+    # Act.
+    await interactions_utils._wait_for_interaction(
+        api_client,
+        _interaction_with_status('queued'),
+        extra_headers={'x-test': '1'},
+    )
+
+    # Assert.
+    assert len(api_client.get_calls) == 2
+    for call in api_client.get_calls:
+      assert call['extra_headers'] == {'x-test': '1'}
+      assert not call['stream']
+
+
+class TestCreateInteractionsWaitsForPending:
+  """``_create_interactions`` hides the wait from its callers."""
+
+  async def test_waits_out_a_pending_create(self, recorded_sleeps):
+    """A create that returns pending is polled before anything is yielded."""
+    # Arrange: create returns queued with no output; the answer arrives later.
+    del recorded_sleeps
+    api_client = _FakeApiClient(
+        interaction=_interaction_with_status('queued'),
+        poll_results=[
+            _interaction_with_status('completed', text='Sunny in Tokyo.')
+        ],
+    )
+
+    # Act.
+    responses = await _drain(
+        interactions_utils._create_interactions(
+            api_client,
+            create_kwargs={'model': 'gemini-2.5-flash'},
+            stream=False,
+        )
+    )
+
+    # Assert: still one response per turn, and it holds the finished result.
+    assert len(api_client.get_calls) == 1
+    assert len(responses) == 1
+    assert responses[0].content.parts[0].text == 'Sunny in Tokyo.'
+
+  async def test_does_not_poll_a_final_create(self):
+    """An ordinary create that is already done is not polled at all."""
+    # Arrange.
+    api_client = _FakeApiClient(interaction=_build_non_streaming_interaction())
+
+    # Act.
+    responses = await _drain(
+        interactions_utils._create_interactions(
+            api_client,
+            create_kwargs={'model': 'gemini-2.5-flash'},
+            stream=False,
+        )
+    )
+
+    # Assert.
+    assert not api_client.get_calls
+    assert len(responses) == 1
+    assert responses[0].content.parts[0].text == 'Sunny in Tokyo.'

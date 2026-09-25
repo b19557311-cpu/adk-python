@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from typing import Any
 from typing import Optional
@@ -27,11 +28,28 @@ from pydantic import Field
 from pydantic import field_validator
 from pydantic import model_validator
 
+from ..models._service_tier import ServiceTier
 from ..sessions.base_session_service import GetSessionConfig
 from ..telemetry.context import TelemetryConfig
 from ._streaming_mode import StreamingMode
 
 logger = logging.getLogger('google_adk.' + __name__)
+
+_DEFAULT_MAX_LLM_CALLS = 500
+
+
+def _default_max_llm_calls() -> int:
+  """Resolves the default max LLM calls limit from environment or fallback."""
+  if env_val := os.getenv('ADK_MAX_LLM_CALLS'):
+    try:
+      return int(env_val)
+    except ValueError:
+      logger.warning(
+          'Invalid value for ADK_MAX_LLM_CALLS env var: %s. Using default %s.',
+          env_val,
+          _DEFAULT_MAX_LLM_CALLS,
+      )
+  return _DEFAULT_MAX_LLM_CALLS
 
 
 class ToolThreadPoolConfig(BaseModel):
@@ -72,8 +90,30 @@ class RunConfig(BaseModel):
   labels: Optional[dict[str, str]] = None
   """User labels for the current invocation (e.g. for billing/attribution)."""
 
+  service_tier: Optional[ServiceTier | str] = None
+  """Serving tier for the model calls of this run.
+
+  Reaches models that call the interactions API through `Gemini`, and nothing
+  else. A model on the generate_content path has no serving tier of its own
+  and ignores it. `ManagedAgent` ignores it too, despite being on the
+  interactions API: it calls `interactions.create` from its own execution
+  loop instead of going through a model, so it never reads this. Leave unset
+  to use the default tier.
+
+  A plain string is accepted alongside the enum, so a tier the backend adds
+  before ADK learns about it still works; unknown values are rejected by the
+  backend.
+
+  `ServiceTier.DEFERRED` queues each model call to run on off-peak capacity,
+  so it waits for room instead of being turned away when capacity is tight.
+  ADK waits for the queued result before yielding, which means the run takes
+  as long as the queue does, and an agent that calls tools queues once per
+  turn rather than once per run. It cannot be combined with
+  `StreamingMode.SSE`.
+  """
+
   response_modalities: Optional[list[types.Modality]] = None
-  """The output modalities. If not set, it's default to AUDIO."""
+  """The output modalities. If not set, it defaults to AUDIO."""
 
   avatar_config: Optional[types.AvatarConfig] = None
   """Avatar configuration for the live agent."""
@@ -207,9 +247,18 @@ class RunConfig(BaseModel):
       ),
   )
 
-  max_llm_calls: int = 500
+  max_llm_calls: int = Field(
+      default_factory=_default_max_llm_calls,
+      description=(
+          'A limit on the total number of llm calls for a given run. Can be'
+          ' overridden by ADK_MAX_LLM_CALLS environment variable.'
+      ),
+  )
   """
   A limit on the total number of llm calls for a given run.
+
+  This limit can be overridden by setting the `ADK_MAX_LLM_CALLS` environment
+  variable.
 
   Valid Values:
     - More than 0 and less than sys.maxsize: The bound on the number of llm
@@ -287,7 +336,7 @@ class RunConfig(BaseModel):
   @field_validator('max_llm_calls', mode='after')
   @classmethod
   def validate_max_llm_calls(cls, value: int) -> int:
-    if value == sys.maxsize:
+    if value >= sys.maxsize:
       raise ValueError(f'max_llm_calls should be less than {sys.maxsize}.')
     elif value <= 0:
       logger.warning(
@@ -299,3 +348,25 @@ class RunConfig(BaseModel):
       )
 
     return value
+
+  @model_validator(mode='after')
+  def validate_service_tier_streaming(self) -> RunConfig:
+    """Rejects a deferred run that also asks to stream.
+
+    A deferred create returns an interaction id as soon as the work is
+    accepted rather than a result, so there is nothing to stream. The
+    interactions transport refuses the combination too, but by then a caller
+    such as `/run_sse` has already opened its response; failing here lets the
+    caller reject the request up front instead.
+    """
+    if (
+        self.service_tier == ServiceTier.DEFERRED
+        and self.streaming_mode == StreamingMode.SSE
+    ):
+      raise ValueError(
+          "service_tier='deferred' cannot be used with StreamingMode.SSE. A"
+          ' deferred request is queued to run on off-peak capacity and returns'
+          ' an interaction id instead of a result, so there is nothing to'
+          ' stream.'
+      )
+    return self

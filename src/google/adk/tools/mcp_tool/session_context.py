@@ -25,17 +25,46 @@ from typing import Coroutine
 from typing import Optional
 from typing import TypeVar
 
-from mcp import ClientSession
-from mcp import SamplingCapability
-from mcp.client.session import ElicitationFnT
-from mcp.client.session import SamplingFnT
-
+from ...dependencies._mcp import ClientSession
+from ...dependencies._mcp import ElicitationFnT
+from ...dependencies._mcp import IS_MCP_SDK_V2
+from ...dependencies._mcp import SamplingCapability
+from ...dependencies._mcp import SamplingFnT
+from ...dependencies._mcp import types
 from ...features import FeatureName
 from ...features import is_feature_enabled
+from ...version import __version__
 
 logger = logging.getLogger('google_adk.' + __name__)
 
 _T = TypeVar('_T')
+
+# Who ADK says it is when it connects. Left unset, the SDK sends its own
+# default -- `mcp` / `0.1.0` -- so a server sees no difference between an ADK
+# agent and any other script built on the SDK.
+_CLIENT_INFO = types.Implementation(name='google-adk', version=__version__)
+
+
+def _read_timeout(seconds: Optional[float]) -> Optional[float | timedelta]:
+  """Converts a timeout in seconds to the type ``ClientSession`` expects.
+
+  ADK carries every timeout as float seconds. MCP SDK 1.x wants a
+  ``timedelta`` here, while 2.x wants the float. Neither accepts the other, and
+  the wrong one does not fail at the call: it fails later, in arithmetic the
+  SDK does on the value. Converting in one place keeps that difference to a
+  single function.
+
+  Args:
+    seconds: The timeout in seconds, or None for no timeout.
+
+  Returns:
+    The timeout in the form the installed SDK expects, or None.
+  """
+  if seconds is None:
+    return None
+  if IS_MCP_SDK_V2:
+    return seconds
+  return timedelta(seconds=seconds)
 
 
 def _format_exception(exc: BaseException | None) -> str:
@@ -104,7 +133,9 @@ class SessionContext:
     Args:
       client: An MCP client context manager (e.g., from streamablehttp_client,
         sse_client, or stdio_client).
-      timeout: Timeout in seconds for connection and initialization.
+      timeout: Timeout in seconds for connection and initialization. This is the
+        budget for the whole bring-up -- entering the client's context and
+        running ``initialize()`` -- not a separate allowance for each step.
       sse_read_timeout: Timeout in seconds for reading data from the MCP SSE
         server.
       is_stdio: Whether this is a stdio connection (affects read timeout).
@@ -144,6 +175,10 @@ class SessionContext:
   async def start(self) -> ClientSession:
     """Start the runner and wait for the session to be ready.
 
+    The wait is bounded by ``timeout``, which covers connecting and
+    initializing together. A connect that eats most of the budget therefore
+    leaves ``initialize()`` less of it.
+
     Returns:
         The initialized ClientSession.
 
@@ -171,7 +206,25 @@ class SessionContext:
 
         self._task.add_done_callback(_retrieve_exception)
 
-    await self._ready_event.wait()
+    if (
+        is_feature_enabled(FeatureName._MCP_GRACEFUL_ERROR_HANDLING)  # pylint: disable=protected-access
+        and self._timeout is not None
+    ):
+      # `_ready_event` is a plain asyncio.Event, so bounding this wait only
+      # cancels a bare future waiter and never crosses an AnyIO cancel
+      # scope. The scopes live inside `self._task` and are unwound there,
+      # in the task that entered them -- the same thing `close()` does for
+      # an abandoned start.
+      try:
+        await asyncio.wait_for(self._ready_event.wait(), timeout=self._timeout)
+      except asyncio.TimeoutError as e:
+        self._task.cancel()
+        raise ConnectionError(
+            'Failed to create MCP session: timed out after'
+            f' {self._timeout}s waiting for the session to become ready'
+        ) from e
+    else:
+      await self._ready_event.wait()
 
     if self._task.cancelled():
       raise ConnectionError('Failed to create MCP session: task cancelled')
@@ -299,9 +352,10 @@ class SessionContext:
           # in a nested task and can cancel from a different task on
           # timeout, producing "Attempted to exit cancel scope in a
           # different task" errors. The connection-establishment timeout
-          # is still enforced by MCPSessionManager.create_session via its
-          # outer asyncio.wait_for around
-          # exit_stack.enter_async_context(SessionContext(...)).
+          # is enforced by `start()`, which bounds its wait on
+          # `_ready_event` -- an asyncio.Event, so bounding it never
+          # cancels across a cancel scope. (create_session's outer
+          # asyncio.wait_for only exists on the flag-off path.)
           transports = await exit_stack.enter_async_context(self._client)
         else:
           # Pre-fix behavior: wrap with asyncio.wait_for so the inner
@@ -321,12 +375,11 @@ class SessionContext:
           session = await exit_stack.enter_async_context(
               ClientSession(
                   *transports[:2],
-                  read_timeout_seconds=timedelta(seconds=self._timeout)
-                  if self._timeout is not None
-                  else None,
+                  read_timeout_seconds=_read_timeout(self._timeout),
                   sampling_callback=self._sampling_callback,
                   sampling_capabilities=self._sampling_capabilities,
                   elicitation_callback=self._elicitation_callback,
+                  client_info=_CLIENT_INFO,
               )
           )
         else:
@@ -335,12 +388,11 @@ class SessionContext:
           session = await exit_stack.enter_async_context(
               ClientSession(
                   *transports[:2],
-                  read_timeout_seconds=timedelta(seconds=self._sse_read_timeout)
-                  if self._sse_read_timeout is not None
-                  else None,
+                  read_timeout_seconds=_read_timeout(self._sse_read_timeout),
                   sampling_callback=self._sampling_callback,
                   sampling_capabilities=self._sampling_capabilities,
                   elicitation_callback=self._elicitation_callback,
+                  client_info=_CLIENT_INFO,
               )
           )
         # pylint: disable-next=protected-access

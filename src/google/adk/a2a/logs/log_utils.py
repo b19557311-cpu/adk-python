@@ -38,7 +38,6 @@ except ImportError as e:
 
 # Constants
 _NEW_LINE = "\n"
-_EXCLUDED_PART_FIELD = {"file": {"bytes"}}
 
 
 def _is_a2a_task(obj: Any) -> TypeGuard[A2ATask]:
@@ -49,14 +48,9 @@ def _is_a2a_task(obj: Any) -> TypeGuard[A2ATask]:
     return type(obj).__name__ == "Task" and hasattr(obj, "status")
 
 
-def _is_a2a_client_event(obj) -> bool:
+def _is_a2a_client_event(obj: object) -> TypeGuard[A2AClientEvent]:
   """Check if an object is an A2A Client Event (Task, UpdateEvent) tuple."""
-  try:
-    return isinstance(obj, tuple) and _is_a2a_task(obj[0])
-  except (TypeError, AttributeError):
-    return (
-        hasattr(obj, "__getitem__") and len(obj) == 2 and _is_a2a_task(obj[0])
-    )
+  return isinstance(obj, tuple) and len(obj) == 2 and _is_a2a_task(obj[0])
 
 
 def _is_a2a_message(obj: Any) -> TypeGuard[A2AMessage]:
@@ -97,7 +91,9 @@ def build_message_part_log(part: A2APart) -> str:
     # File parts / other kinds.
     part_kind = _compat.part_kind_label(part)
     try:
-      part_content = f"{part_kind}: {json.dumps(_compat.a2a_to_dict(part))}"
+      # Raw file bytes never go into a log line.
+      part_dict = _compat.a2a_to_dict(part, exclude_file_bytes=True)
+      part_content = f"{part_kind}: {json.dumps(part_dict)}"
     except Exception:
       part_content = f"{part_kind}: <unserializable>"
 

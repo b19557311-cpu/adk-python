@@ -18,7 +18,6 @@ from collections.abc import Callable
 import json
 import logging
 from typing import Any
-from typing import Dict
 from typing import List
 from typing import Optional
 
@@ -33,7 +32,7 @@ from google.genai import types as genai_types
 from .. import _compat
 from ...agents.invocation_context import InvocationContext
 from ...events.event import Event
-from ...flows.llm_flows.functions import REQUEST_EUC_FUNCTION_CALL_NAME
+from ...flows.llm_flows.tools._functions import REQUEST_EUC_FUNCTION_CALL_NAME
 from ..experimental import a2a_experimental
 from .part_converter import A2A_DATA_PART_METADATA_IS_LONG_RUNNING_KEY
 from .part_converter import A2A_DATA_PART_METADATA_TYPE_FUNCTION_CALL
@@ -81,7 +80,7 @@ Returns:
 """
 
 
-def _serialize_metadata_value(value: Any) -> str:
+def _serialize_metadata_value(value: object) -> object:
   """Safely serializes metadata values to string format.
 
   Args:
@@ -109,7 +108,7 @@ def _serialize_metadata_value(value: Any) -> str:
 
 def _get_context_metadata(
     event: Event, invocation_context: InvocationContext
-) -> Dict[str, str]:
+) -> dict[str, object]:
   """Gets the context metadata for the event.
 
   Args:
@@ -128,7 +127,7 @@ def _get_context_metadata(
     raise ValueError("Invocation context cannot be None")
 
   try:
-    metadata = {
+    metadata: dict[str, object] = {
         _get_adk_metadata_key("app_name"): invocation_context.app_name,
         _get_adk_metadata_key("user_id"): invocation_context.user_id,
         _get_adk_metadata_key("session_id"): invocation_context.session.id,
@@ -257,6 +256,17 @@ def convert_a2a_task_to_event(
         event: Event = convert_a2a_message_to_event(
             message, author, invocation_context, part_converter=part_converter
         )
+        if (
+            getattr(a2a_task.status, "state", None)
+            in (
+                _compat.TS_COMPLETED,
+                _compat.TS_FAILED,
+                _compat.TS_CANCELED,
+            )
+            and event.content
+            and event.content.parts
+        ):
+          event.actions.skip_summarization = True
         return event
       except Exception as e:
         logger.error("Failed to convert A2A task message to event: %s", e)

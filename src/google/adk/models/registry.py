@@ -120,6 +120,7 @@ class LLMRegistry:
       )
 
     _llm_registry_dict[model_name_regex] = llm_cls
+    LLMRegistry.resolve.cache_clear()
 
   @staticmethod
   def register(llm_cls: type[BaseLlm]) -> None:
@@ -139,6 +140,7 @@ class LLMRegistry:
     """Pre-registers a lazily-imported LLM class."""
     for regex in model_name_regexes:
       _llm_registry_dict[regex] = (module_path, class_name)
+    LLMRegistry.resolve.cache_clear()
 
   @staticmethod
   @lru_cache(maxsize=32)
@@ -198,6 +200,12 @@ class LLMRegistry:
           '\nInstall it with: pip install google-adk[extensions]'
           '\nOr: pip install anthropic>=0.43.0'
       )
+    elif re.fullmatch(r'gpt-.*|o\d+-.*', model):
+      error_msg += (
+          '\n\nOpenAI models require the openai package.'
+          '\nInstall it with: pip install google-adk[openai]'
+          '\nOr: pip install openai>=2.20'
+      )
     elif '/' in model:
       # Any model with provider/model format likely needs LiteLLM
       error_msg += (
@@ -208,6 +216,13 @@ class LLMRegistry:
           '\n\nSupported providers include: openai, groq, anthropic, and 100+'
           ' others.'
           '\nSee https://docs.litellm.ai/docs/providers for a full list.'
+      )
+    else:
+      error_msg += (
+          '\n\nA bare model name resolves only for the providers ADK registers'
+          ' directly. Everything else is reached through litellm, under a'
+          ' "provider/model" name such as "openai/gpt-4o".'
+          '\nInstall it with: pip install google-adk[extensions]'
       )
 
     raise ValueError(error_msg)

@@ -26,11 +26,17 @@ import base64
 import dataclasses
 from datetime import datetime
 from datetime import timezone
+import importlib
 import json
+import logging
 from typing import Any
 from typing import AsyncGenerator
 from typing import Callable
+from typing import cast
 from typing import Optional
+from typing import TYPE_CHECKING
+from typing import TypeAlias
+from typing import TypeVar
 
 from a2a.client.client import ClientConfig as A2AClientConfig
 from a2a.client.client_factory import ClientFactory as A2AClientFactory
@@ -51,34 +57,6 @@ from google.protobuf.json_format import ParseDict
 
 from ..utils.context_utils import Aclosing
 
-
-def _make_proto_timestamp(dt: Optional[datetime] = None) -> Any:
-  """Build a google.protobuf.Timestamp from a datetime (or now). 1.x only."""
-  from google.protobuf import timestamp_pb2
-
-  ts = timestamp_pb2.Timestamp()
-  ts.FromDatetime(dt or datetime.now(timezone.utc))
-  return ts
-
-
-def _make_proto_value_from_dict(d: dict[str, Any]) -> Any:
-  """Wrap a plain dict as a google.protobuf.Value (struct_value). 1.x only."""
-  from google.protobuf.struct_pb2 import Struct
-  from google.protobuf.struct_pb2 import Value
-
-  v = Value()
-  s = Struct()
-  ParseDict(d, s)
-  v.struct_value.CopyFrom(s)
-  return v
-
-
-def _proto_to_dict(msg: Any) -> dict[str, Any]:
-  """Convert a protobuf message (e.g. Struct/Value) to a plain dict."""
-  result: dict[str, Any] = MessageToDict(msg)
-  return result
-
-
 # -----------------------------------------------------------------------------
 # Version detection
 # -----------------------------------------------------------------------------
@@ -91,12 +69,78 @@ except ImportError:
 
 
 # -----------------------------------------------------------------------------
+# Protobuf WKT helpers (1.x.x only)
+# -----------------------------------------------------------------------------
+if IS_A2A_V1:
+  try:
+    from google.protobuf import timestamp_pb2
+    from google.protobuf.struct_pb2 import Struct
+    from google.protobuf.struct_pb2 import Value
+  except ModuleNotFoundError as e:
+    logging.getLogger("google_adk." + __name__).warning(
+        "google protobuf WKT unavailable %s", e
+    )
+
+
+def _dynamic_type(module_name: str, type_name: str) -> type[Any]:
+  """Loads a type that exists only in one supported A2A SDK generation."""
+  value = getattr(importlib.import_module(module_name), type_name, None)
+  if not isinstance(value, type):
+    raise ImportError(f"{module_name}.{type_name} is unavailable")
+  return cast(type[Any], value)
+
+
+_T = TypeVar("_T")
+
+
+def _as_factory(target: type[_T]) -> Callable[..., _T]:
+  """Types a class whose constructor signature differs across SDK generations.
+
+  Call this at the construction site, never at module level: binding the class
+  once at import time would freeze it past any later patch of the global.
+  """
+  return cast(Callable[..., _T], target)
+
+
+def _make_proto_timestamp(dt: Optional[datetime] = None) -> Any:
+  """Build a google.protobuf.Timestamp from a datetime (or now). 1.x only."""
+  ts = timestamp_pb2.Timestamp()  # type: ignore[possibly-undefined]
+  ts.FromDatetime(dt or datetime.now(timezone.utc))
+  return ts
+
+
+def _make_proto_value_from_dict(d: dict[str, Any]) -> Any:
+  """Wrap a plain dict as a google.protobuf.Value (struct_value). 1.x only."""
+  v = Value()  # type: ignore[possibly-undefined]
+  s = Struct()  # type: ignore[possibly-undefined]
+  ParseDict(d, s)
+  v.struct_value.CopyFrom(s)
+  return v
+
+
+def _proto_to_dict(msg: Any) -> dict[str, Any]:
+  """Convert a protobuf message (e.g. Struct/Value) to a plain dict."""
+  result: dict[str, Any] = MessageToDict(msg)
+  return result
+
+
+# -----------------------------------------------------------------------------
 # Enum & constant wrappers
 # -----------------------------------------------------------------------------
+if TYPE_CHECKING:
+  from a2a.utils.constants import TransportProtocol as TransportProtocol
+else:
+  if IS_A2A_V1:
+    from a2a.utils.constants import TransportProtocol as TransportProtocol
+  else:
+    TransportProtocol = _dynamic_type("a2a.types", "TransportProtocol")
+
+
 if IS_A2A_V1:
   # 1.x: protobuf EnumTypeWrapper — access values as integer constants.
   ROLE_USER = Role.Value("ROLE_USER")
   ROLE_AGENT = Role.Value("ROLE_AGENT")
+  TS_UNKNOWN = TaskState.Value("TASK_STATE_UNSPECIFIED")
   TS_SUBMITTED = TaskState.Value("TASK_STATE_SUBMITTED")
   TS_WORKING = TaskState.Value("TASK_STATE_WORKING")
   TS_COMPLETED = TaskState.Value("TASK_STATE_COMPLETED")
@@ -105,9 +149,6 @@ if IS_A2A_V1:
   TS_AUTH_REQUIRED = TaskState.Value("TASK_STATE_AUTH_REQUIRED")
   TS_CANCELED = TaskState.Value("TASK_STATE_CANCELED")
 
-  # 1.x: TransportProtocol is in ``a2a.utils.constants`` as a ``str`` Enum.
-  from a2a.utils.constants import TransportProtocol as TransportProtocol
-
   TP_JSONRPC = TransportProtocol.JSONRPC
   TP_HTTP_JSON = TransportProtocol.HTTP_JSON
   TP_GRPC = TransportProtocol.GRPC
@@ -115,6 +156,7 @@ if IS_A2A_V1:
 else:
   # 0.3.x: pydantic enum
   ROLE_USER, ROLE_AGENT = Role.user, Role.agent
+  TS_UNKNOWN = TaskState.unknown
   TS_SUBMITTED = TaskState.submitted
   TS_WORKING = TaskState.working
   TS_COMPLETED = TaskState.completed
@@ -123,23 +165,24 @@ else:
   TS_AUTH_REQUIRED = TaskState.auth_required
   TS_CANCELED = TaskState.canceled
 
-  # 0.3.x: TransportProtocol is in ``a2a.types``.
-  from a2a.types import TransportProtocol as TransportProtocol  # type: ignore[assignment,no-redef,attr-defined]
-
-  TP_JSONRPC = TransportProtocol.jsonrpc
-  TP_HTTP_JSON = TransportProtocol.http_json
-  TP_GRPC = TransportProtocol.grpc
+  TP_JSONRPC = getattr(TransportProtocol, "jsonrpc")
+  TP_HTTP_JSON = getattr(TransportProtocol, "http_json")
+  TP_GRPC = getattr(TransportProtocol, "grpc")
 
 
 # Normalized client-stream item (output of ``make_stream_normalizer``). On 0.3.x
 # this is the SDK's ``ClientEvent`` tuple; 1.x removed it, so rebuild the
 # equivalent tuple from that version's types.
-if IS_A2A_V1:
+if TYPE_CHECKING:
+  A2AClientEvent: TypeAlias = tuple[
+      Task, TaskStatusUpdateEvent | TaskArtifactUpdateEvent | None
+  ]
+elif IS_A2A_V1:
   A2AClientEvent = tuple[
       Task, TaskStatusUpdateEvent | TaskArtifactUpdateEvent | None
   ]
 else:
-  from a2a.client import ClientEvent as A2AClientEvent  # type: ignore[assignment,no-redef,attr-defined]  # noqa: F401
+  A2AClientEvent = getattr(importlib.import_module("a2a.client"), "ClientEvent")
 
 
 # -----------------------------------------------------------------------------
@@ -152,9 +195,9 @@ def make_text_part(text: str) -> Part:
     return Part(text=text)
   else:
     # 0.3.x: Part wraps a discriminated union via ``.root``.
-    from a2a.types import TextPart
+    from a2a.types import TextPart  # type: ignore[attr-defined]
 
-    return Part(root=TextPart(text=text))
+    return _as_factory(Part)(root=TextPart(text=text))
 
 
 def is_text_part(p: Part) -> bool:
@@ -163,7 +206,7 @@ def is_text_part(p: Part) -> bool:
     is_text: bool = p.WhichOneof("content") == "text"
     return is_text
   else:
-    from a2a.types import TextPart
+    from a2a.types import TextPart  # type: ignore[attr-defined]
 
     return isinstance(p.root, TextPart)
 
@@ -173,7 +216,7 @@ def is_file_part(p: Part) -> bool:
   if IS_A2A_V1:
     return p.WhichOneof("content") in ("raw", "url")
   else:
-    from a2a.types import FilePart
+    from a2a.types import FilePart  # type: ignore[attr-defined]
 
     return isinstance(p.root, FilePart)
 
@@ -184,7 +227,7 @@ def is_data_part(p: Part) -> bool:
     is_data: bool = p.WhichOneof("content") == "data"
     return is_data
   else:
-    from a2a.types import DataPart
+    from a2a.types import DataPart  # type: ignore[attr-defined]
 
     return isinstance(p.root, DataPart)
 
@@ -218,9 +261,7 @@ def part_metadata(p: Part) -> dict[str, Any]:
 def set_part_metadata(p: Part, metadata: dict[str, Any]) -> None:
   """Writes a Part's metadata."""
   if IS_A2A_V1:
-    from google.protobuf.struct_pb2 import Struct
-
-    p.metadata.CopyFrom(ParseDict(metadata, Struct()))
+    p.metadata.CopyFrom(ParseDict(metadata, Struct()))  # type: ignore[possibly-undefined]
   else:
     p.root.metadata = metadata
 
@@ -244,10 +285,10 @@ def make_file_part_with_uri(
       p.filename = name
     return p
   else:
-    from a2a.types import FilePart
-    from a2a.types import FileWithUri
+    from a2a.types import FilePart  # type: ignore[attr-defined]
+    from a2a.types import FileWithUri  # type: ignore[attr-defined]
 
-    return Part(
+    return _as_factory(Part)(
         root=FilePart(file=FileWithUri(uri=uri, mime_type=mime_type, name=name))
     )
 
@@ -267,10 +308,10 @@ def make_file_part_with_bytes(
       p.filename = name
     return p
   else:
-    from a2a.types import FilePart
-    from a2a.types import FileWithBytes
+    from a2a.types import FilePart  # type: ignore[attr-defined]
+    from a2a.types import FileWithBytes  # type: ignore[attr-defined]
 
-    return Part(
+    return _as_factory(Part)(
         root=FilePart(
             file=FileWithBytes(
                 bytes=base64.b64encode(data).decode("utf-8"),
@@ -292,9 +333,9 @@ def make_data_part(
       set_part_metadata(p, metadata)
     return p
   else:
-    from a2a.types import DataPart
+    from a2a.types import DataPart  # type: ignore[attr-defined]
 
-    return Part(root=DataPart(data=data, metadata=metadata))
+    return _as_factory(Part)(root=DataPart(data=data, metadata=metadata))
 
 
 def make_data_part_from_blob(
@@ -313,14 +354,14 @@ def make_data_part_from_blob(
     data_dict = json.loads(raw_json)
     return make_data_part(data=data_dict, metadata=extra_metadata)
   else:
-    from a2a.types import DataPart
+    from a2a.types import DataPart  # type: ignore[attr-defined]
 
     inner = DataPart.model_validate_json(raw_json)
     if extra_metadata:
       if inner.metadata is None:
         inner.metadata = {}
       inner.metadata.update(extra_metadata)
-    return Part(root=inner)
+    return _as_factory(Part)(root=inner)
 
 
 def file_part_uri(p: Part) -> Optional[str]:
@@ -328,7 +369,7 @@ def file_part_uri(p: Part) -> Optional[str]:
   if IS_A2A_V1:
     return p.url if p.WhichOneof("content") == "url" else None
   else:
-    from a2a.types import FileWithUri
+    from a2a.types import FileWithUri  # type: ignore[attr-defined]
 
     inner = p.root
     file = getattr(inner, "file", None)
@@ -340,7 +381,7 @@ def file_part_bytes(p: Part) -> Optional[bytes]:
   if IS_A2A_V1:
     return p.raw if p.WhichOneof("content") == "raw" else None
   else:
-    from a2a.types import FileWithBytes
+    from a2a.types import FileWithBytes  # type: ignore[attr-defined]
 
     inner = p.root
     file = getattr(inner, "file", None)
@@ -404,14 +445,25 @@ def data_part_blob_bytes(p: Part) -> bytes:
 # -----------------------------------------------------------------------------
 # Serialization helper (model_dump → MessageToDict)
 # -----------------------------------------------------------------------------
-def a2a_to_dict(obj: Any) -> dict[str, Any]:
-  """Serializes an A2A object to a plain dict."""
+def a2a_to_dict(
+    obj: Any, *, exclude_file_bytes: bool = False
+) -> dict[str, Any]:
+  """Serializes an A2A object to a plain dict.
+
+  ``exclude_file_bytes`` drops a file Part's raw payload, which the two SDK
+  generations keep in different places: a flat ``raw`` field on 1.x, nested
+  under ``file.bytes`` on 0.3.x. It leaves the descriptive file fields alone.
+  """
   if IS_A2A_V1:
     proto_dict: dict[str, Any] = MessageToDict(obj)
+    if exclude_file_bytes:
+      proto_dict.pop("raw", None)
     return proto_dict
   else:
     model_dict: dict[str, Any] = obj.model_dump(
-        exclude_none=True, by_alias=True
+        exclude_none=True,
+        by_alias=True,
+        exclude={"file": {"bytes"}} if exclude_file_bytes else None,
     )
     return model_dict
 
@@ -445,7 +497,6 @@ def build_agent_card(
     default_input_modes: Any = ("text/plain",),
     default_output_modes: Any = ("text/plain",),
     supports_authenticated_extended_card: bool = False,
-    streaming: bool = False,
 ) -> AgentCard:
   """Builds an ``AgentCard`` from primitive fields.
 
@@ -453,6 +504,10 @@ def build_agent_card(
          transport is ``preferredTransport``.
   1.x:   ``AgentCard`` is a proto message — RPC URL lives in
          ``supported_interfaces[i].url`` (with ``protocol_binding``).
+
+  A caller that knows what the agent supports passes ``capabilities``. Callers
+  that do not, such as a registry entry holding no card of its own, get a card
+  claiming no optional capability rather than one guessing at them.
   """
 
   def _as_dict(obj: Any) -> Any:
@@ -468,7 +523,7 @@ def build_agent_card(
       "1.0" if IS_A2A_V1 else "0.3.0"
   )
 
-  default_capabilities = {"streaming": streaming, "push_notifications": False}
+  default_capabilities = {"streaming": False, "push_notifications": False}
 
   if IS_A2A_V1:
     iface: dict[str, Any] = {
@@ -519,16 +574,28 @@ def build_agent_card(
 # -----------------------------------------------------------------------------
 # Client error & ClientCallContext shims
 # -----------------------------------------------------------------------------
+if TYPE_CHECKING:
+  from a2a.client.client import ClientCallContext as ClientCallContext
+elif IS_A2A_V1:
+  from a2a.client.client import ClientCallContext as ClientCallContext
+else:
+  ClientCallContext = _dynamic_type(
+      "a2a.client.middleware", "ClientCallContext"
+  )
+
+
+A2A_HTTP_ERRORS: tuple[type[Exception], ...]
 if IS_A2A_V1:
   # ``ClientCallContext`` moved from ``a2a.client.middleware`` to ``a2a.client.client``
   # ``A2AClientHTTPError`` is gone; use ``A2AClientError`` (carries status_code attr)
-  from a2a.client.client import ClientCallContext as ClientCallContext
   from a2a.client.errors import A2AClientError as _A2AClientError
 
   A2A_HTTP_ERRORS = (_A2AClientError,)
 else:
-  from a2a.client.errors import A2AClientHTTPError
-  from a2a.client.middleware import ClientCallContext as ClientCallContext  # type: ignore[assignment,no-redef]  # noqa: F401
+  A2AClientHTTPError = cast(
+      type[Exception],
+      _dynamic_type("a2a.client.errors", "A2AClientHTTPError"),
+  )
 
   A2A_HTTP_ERRORS = (A2AClientHTTPError,)
 
@@ -700,12 +767,11 @@ async def send_message(
   """
   if IS_A2A_V1:
     from a2a.types import SendMessageRequest
-    from google.protobuf.struct_pb2 import Struct
 
     smr = SendMessageRequest()
     smr.message.CopyFrom(request)
     if request_metadata:
-      smr.metadata.CopyFrom(ParseDict(request_metadata, Struct()))
+      smr.metadata.CopyFrom(ParseDict(request_metadata, Struct()))  # type: ignore[possibly-undefined]
     async with Aclosing(client.send_message(smr, context=context)) as agen:
       async for item in agen:
         yield item
@@ -766,7 +832,7 @@ def rebind_client_factory_httpx(factory: Any, httpx_client: Any) -> Any:
     )
 
   registry = factory._registry  # pylint: disable=protected-access
-  new_factory = A2AClientFactory(
+  new_factory: Any = _as_factory(A2AClientFactory)(
       config=dataclasses.replace(
           factory._config,  # pylint: disable=protected-access
           httpx_client=httpx_client,
@@ -802,7 +868,8 @@ def attach_a2a_routes_to_app(
     from a2a.server.routes import create_agent_card_routes
     from a2a.server.routes import create_jsonrpc_routes
 
-    handler = DefaultRequestHandler(
+    handler_factory = cast(Callable[..., Any], DefaultRequestHandler)
+    handler = handler_factory(
         agent_executor=agent_executor,
         task_store=task_store,
         push_config_store=push_config_store,
@@ -835,7 +902,8 @@ def attach_a2a_routes_to_app(
     except ImportError:
       AGENT_CARD_WELL_KNOWN_PATH = "/.well-known/agent-card.json"
 
-    handler = DefaultRequestHandler(
+    handler_factory = cast(Callable[..., Any], DefaultRequestHandler)
+    handler = handler_factory(
         agent_executor=agent_executor,
         task_store=task_store,
         push_config_store=push_config_store,
@@ -909,7 +977,7 @@ def make_api_key_scheme(*, name: str, location: str = "header") -> Any:
         )
     )
   else:
-    return SecurityScheme(
+    return _as_factory(SecurityScheme)(
         root=APIKeySecurityScheme(name=name, **{"in": location})
     )
 
@@ -1039,7 +1107,7 @@ def make_task_status_update_event(
     *,
     final: bool = True,
     metadata: Any = None,
-) -> Any:
+) -> TaskStatusUpdateEvent:
   """Build a TaskStatusUpdateEvent, omitting ``final`` on 1.x (field gone).
 
   0.3.x: ``TaskStatusUpdateEvent`` has a ``final`` bool field.
@@ -1071,9 +1139,7 @@ def set_event_metadata(event: Any, metadata: dict[str, Any]) -> None:
   if not metadata:
     return
   if IS_A2A_V1:
-    from google.protobuf.struct_pb2 import Struct
-
-    event.metadata.CopyFrom(ParseDict(metadata, Struct()))
+    event.metadata.CopyFrom(ParseDict(metadata, Struct()))  # type: ignore[possibly-undefined]
   else:
     event.metadata = metadata
 
@@ -1124,9 +1190,7 @@ def set_struct_metadata(obj: Any, metadata: dict[str, Any]) -> None:
   if not metadata:
     return
   if IS_A2A_V1:
-    from google.protobuf.struct_pb2 import Struct
-
-    obj.metadata.CopyFrom(ParseDict(dict(metadata), Struct()))
+    obj.metadata.CopyFrom(ParseDict(dict(metadata), Struct()))  # type: ignore[possibly-undefined]
   else:
     obj.metadata = dict(metadata)
 

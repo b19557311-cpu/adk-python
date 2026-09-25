@@ -16,22 +16,29 @@ from __future__ import annotations
 
 import base64
 import binascii
+from collections.abc import Sequence
+import inspect
 import io
 import json
 import logging
 import re
 import struct
 from typing import Any
+from typing import Awaitable
+from typing import Callable
 from typing import TYPE_CHECKING
 import zipfile
 
 from google.genai import types
 from typing_extensions import override
+from typing_extensions import TypeAlias
 
 from ..features import FeatureName
 from ..features import is_feature_enabled
 from .base_tool import BaseTool
 
+# Marks an artifact as scoped to the user rather than to a single session.
+_USER_NAMESPACE_PREFIX = 'user:'
 # MIME types Gemini accepts for inline data in requests.
 _GEMINI_SUPPORTED_INLINE_MIME_PREFIXES = (
     'image/',
@@ -42,7 +49,7 @@ _GEMINI_SUPPORTED_INLINE_MIME_TYPES = frozenset({'application/pdf'})
 # MIME subtypes that match a supported prefix above but that Gemini
 # rejects with 400 INVALID_ARGUMENT when sent as inline data. These
 # must fall through to the text-conversion path in
-# `_as_safe_part_for_llm` instead of being forwarded as inline image
+# `as_safe_part_for_llm` instead of being forwarded as inline image
 # data. Verified empirically against gemini-2.5-flash via
 # google-genai 1.69.0 on 2026-05-13.
 _GEMINI_UNSUPPORTED_INLINE_SUBTYPES = frozenset({
@@ -61,6 +68,10 @@ _TEXT_LIKE_MIME_TYPES = frozenset({
     'image/svg',
     'image/svg+xml',
     'image/xml',
+})
+_SPREADSHEET_MIME_TYPES = frozenset({
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.ms-excel',
 })
 
 if TYPE_CHECKING:
@@ -136,10 +147,90 @@ def _try_extract_docx_text(data: bytes) -> str | None:
     return None
 
 
-def _as_safe_part_for_llm(
-    artifact: types.Part, artifact_name: str
+def _parse_spreadsheet(data: bytes) -> str:
+  """Parses a spreadsheet into a markdown representation.
+
+  Args:
+    data: The bytes content of the spreadsheet file (e.g., XLSX).
+
+  Returns:
+    A markdown string representing the spreadsheet, capped at 100 rows.
+    Each sheet is rendered as a separate markdown table with a heading.
+    Returns "[Empty Spreadsheet]" if the spreadsheet contains no data.
+    Returns "[Error parsing spreadsheet: {e}]" if an error occurs during
+    parsing, including details of the exception.
+  """
+  try:
+    import pandas as pd
+
+    with pd.ExcelFile(io.BytesIO(data)) as xl:
+      output = []
+
+      # Process each sheet
+      for sheet_name in xl.sheet_names:
+        df = xl.parse(sheet_name)
+        if df.empty:
+          continue
+        # Cap rows to avoid exceeding context window limits
+        max_rows = 100
+        total_rows = len(df)
+
+        if total_rows > max_rows:
+          df_display = df.head(max_rows)
+          truncation_notice = (
+              f'\n\n[Output is limited to the first {max_rows} rows. Total '
+              f'rows: {total_rows}]'
+          )
+        else:
+          df_display = df
+          truncation_notice = ''
+
+        # Convert to markdown table
+        markdown_table = df_display.to_markdown(
+            index=False, numalign='left', stralign='left'
+        )
+
+        if markdown_table:
+          markdown_table += truncation_notice
+
+        output.append(f'### Sheet: {sheet_name}\n\n{markdown_table}')
+
+      if not output:
+        return '[Empty Spreadsheet]'
+
+      return '\n\n'.join(output)
+
+  except ImportError as e:
+    logger.warning(f'Missing dependency for spreadsheet parsing: {e!r}')
+    return (
+        f'[Missing dependency: {e!r}. Pandas and its support libraries are'
+        ' required to parse spreadsheets. Please install them using `pip'
+        ' install pandas openpyxl tabulate xlrd`.]'
+    )
+  except ValueError as e:
+    logger.warning(f'Invalid spreadsheet format or data: {e!r}')
+    return f'[Invalid spreadsheet format: {e!r}]'
+  except Exception as e:
+    logger.warning(f'Failed to parse spreadsheet: {e!r}')
+    return f'[Error parsing spreadsheet: {e!r}]'
+
+
+def as_safe_part_for_llm(
+    artifact: types.Part,
+    artifact_name: str,
+    enable_spreadsheet_parsing: bool = False,
 ) -> types.Part:
-  """Returns a Part that is safe to send to Gemini."""
+  """Returns a Part that is safe to send to an LLM.
+
+  Useful for providing standard safety conversions for user-uploaded artifacts.
+
+  Args:
+    artifact: The artifact to convert to a safe Part.
+    artifact_name: The name of the artifact.
+
+  Returns:
+    A safe Part for Gemini.
+  """
   inline_data = artifact.inline_data
   if inline_data is None:
     return artifact
@@ -187,6 +278,12 @@ def _as_safe_part_for_llm(
     except UnicodeDecodeError:
       return types.Part.from_text(text=data.decode('utf-8', errors='replace'))
 
+  if enable_spreadsheet_parsing and (
+      mime_type in _SPREADSHEET_MIME_TYPES
+      or artifact_name.lower().endswith(('.xlsx', '.xls'))
+  ):
+    return types.Part.from_text(text=_parse_spreadsheet(data))
+
   size_kb = len(data) / 1024
   return types.Part.from_text(
       text=(
@@ -197,10 +294,77 @@ def _as_safe_part_for_llm(
   )
 
 
+ProcessArtifactCallback: TypeAlias = Callable[
+    [types.Part, str],
+    types.Part | None | Awaitable[types.Part | None],
+]
+
+
+def _resolve_requested_artifact_name(
+    requested_name: str, available_names: set[str]
+) -> str | None:
+  """Maps a name the model asked for onto one the current session really has.
+
+  The model chooses the name, so it is untrusted input: it is only honoured
+  when the artifact service just listed it for this app, user and session.
+  Backends key their storage on those identifiers joined with the filename, so
+  one that normalises or splits the joined key could resolve a name that was
+  never listed into a different scope.
+
+  Args:
+      requested_name: The artifact name supplied by the model.
+      available_names: Names listed for the current scope, which is also the
+        list the model was shown.
+
+  Returns:
+      The name to load, or None if the request does not match anything in
+      scope.
+  """
+  if requested_name in available_names:
+    return requested_name
+  # User-scoped artifacts are often listed with their "user:" prefix and
+  # models routinely drop it when echoing the name back. Conversely,
+  # FileArtifactService lists an artifact saved with session_id=None under
+  # its bare name, but a model may request it with the "user:" prefix.
+  if requested_name.startswith(_USER_NAMESPACE_PREFIX):
+    bare_name = requested_name.removeprefix(_USER_NAMESPACE_PREFIX)
+    if bare_name in available_names:
+      return requested_name
+  else:
+    prefixed_name = f'{_USER_NAMESPACE_PREFIX}{requested_name}'
+    if prefixed_name in available_names:
+      return prefixed_name
+  return None
+
+
 class LoadArtifactsTool(BaseTool):
   """A tool that loads the artifacts and adds them to the session."""
 
-  def __init__(self):
+  def __init__(
+      self,
+      *,
+      process_artifact: ProcessArtifactCallback | None = None,
+      enable_spreadsheet_parsing: bool = False,
+  ) -> None:
+    """Initializes the tool.
+
+    Args:
+      process_artifact: An optional sync or async callable with signature
+        `(artifact: types.Part, artifact_name: str) -> types.Part | None |
+        Awaitable[types.Part | None]`. Allows artifact parts to be customized or
+        filtered before being added to the LLM request. `artifact_name` is the
+        name the artifact was loaded under, which carries the `user:` prefix for
+        a user-scoped artifact even when the model omitted it. If `None`
+        (default), the built-in safety conversion (`as_safe_part_for_llm`) is
+        used to convert unsupported formats (e.g., extracting text from
+        DOCX/CSV/JSON/plain text or replacing binary data with safe placeholder
+        descriptions). If a custom function is supplied, it bypasses default
+        safety conversions; returning `None` skips the artifact so it is omitted
+        from the request. If a custom callback raises an exception, the error is
+        logged and the artifact is skipped.
+      enable_spreadsheet_parsing: Whether to enable spreadsheet parsing files
+        (e.g., .xlsx, .xls) into text. Defaults to False.
+    """
     super().__init__(
         name='load_artifacts',
         description=("""Loads artifacts into the session for this request.
@@ -208,6 +372,8 @@ class LoadArtifactsTool(BaseTool):
 NOTE: Call when you need access to artifacts (for example, uploads saved by the
 web UI)."""),
     )
+    self._process_artifact: ProcessArtifactCallback | None = process_artifact
+    self._enable_spreadsheet_parsing: bool = enable_spreadsheet_parsing
 
   def _get_declaration(self) -> types.FunctionDeclaration | None:
     if is_feature_enabled(FeatureName.JSON_SCHEMA_FOR_FUNC_DECL):
@@ -244,7 +410,21 @@ web UI)."""),
   async def run_async(
       self, *, args: dict[str, Any], tool_context: ToolContext
   ) -> Any:
-    artifact_names: list[str] = args.get('artifact_names', [])
+    raw_artifact_names = args.get('artifact_names', [])
+    # Any sequence is accepted, because a caller that builds the args itself
+    # may pass a tuple.
+    if (
+        isinstance(raw_artifact_names, (str, bytes))
+        or not isinstance(raw_artifact_names, Sequence)
+        or not all(isinstance(name, str) for name in raw_artifact_names)
+    ):
+      return {
+          'error': "'artifact_names' must be a list of strings.",
+          'error_code': 'INVALID_ARGUMENTS',
+      }
+    artifact_names = [
+        name for name in raw_artifact_names if isinstance(name, str)
+    ]
     return {
         'artifact_names': artifact_names,
         'status': (
@@ -267,7 +447,7 @@ web UI)."""),
 
   async def _append_artifacts_to_llm_request(
       self, *, tool_context: ToolContext, llm_request: LlmRequest
-  ):
+  ) -> None:
     artifact_names = await tool_context.list_artifacts()
     if not artifact_names:
       return
@@ -286,46 +466,93 @@ web UI)."""),
     # Attach the content of the artifacts if the model requests them.
     # This only adds the content to the model request, instead of the session.
     if llm_request.contents and llm_request.contents[-1].parts:
-      function_response = llm_request.contents[-1].parts[0].function_response
-      if function_response and function_response.name == 'load_artifacts':
-        response = function_response.response or {}
-        artifact_names = response.get('artifact_names', [])
-        for artifact_name in artifact_names:
-          # Try session-scoped first (default behavior)
-          artifact = await tool_context.load_artifact(artifact_name)
-
-          # If not found and name doesn't already have user: prefix,
-          # try cross-session artifacts with user: prefix
-          if artifact is None and not artifact_name.startswith('user:'):
-            prefixed_name = f'user:{artifact_name}'
-            artifact = await tool_context.load_artifact(prefixed_name)
-
-          if artifact is None:
-            logger.warning('Artifact "%s" not found, skipping', artifact_name)
+      available_names = set(artifact_names)
+      for part in llm_request.contents[-1].parts:
+        function_response = part.function_response
+        if function_response and function_response.name == 'load_artifacts':
+          response = function_response.response or {}
+          raw_artifact_names = response.get('artifact_names', [])
+          if (
+              isinstance(raw_artifact_names, (str, bytes))
+              or not isinstance(raw_artifact_names, Sequence)
+              or not all(isinstance(name, str) for name in raw_artifact_names)
+          ):
+            logger.warning(
+                'Ignoring invalid artifact_names in load_artifacts response.'
+            )
             continue
-
-          artifact_part = _as_safe_part_for_llm(artifact, artifact_name)
-          if artifact_part is not artifact:
-            mime_type = (
-                artifact.inline_data.mime_type if artifact.inline_data else None
+          for requested_name in raw_artifact_names:
+            artifact_name = _resolve_requested_artifact_name(
+                requested_name, available_names
             )
-            logger.debug(
-                'Converted artifact "%s" (mime_type=%s) to text Part',
-                artifact_name,
-                mime_type,
-            )
-
-          llm_request.contents.append(
-              types.Content(
-                  role='user',
-                  parts=[
-                      types.Part.from_text(
-                          text=f'Artifact {artifact_name} is:'
-                      ),
-                      artifact_part,
-                  ],
+            if artifact_name is None:
+              logger.warning(
+                  'Artifact "%s" is not available in this session, skipping',
+                  requested_name,
               )
-          )
+              continue
+
+            artifact = await tool_context.load_artifact(artifact_name)
+
+            # A backend may list a user-scoped artifact under its bare name, in
+            # which case the session scope searched above does not hold it. The
+            # retry stays within this user because the name was listed for them.
+            if artifact is None and not artifact_name.startswith(
+                _USER_NAMESPACE_PREFIX
+            ):
+              artifact_name = f'{_USER_NAMESPACE_PREFIX}{artifact_name}'
+              artifact = await tool_context.load_artifact(artifact_name)
+
+            if artifact is None:
+              logger.warning('Artifact "%s" not found, skipping', artifact_name)
+              continue
+
+            # The resolved name, so a callback that filters on scope sees the
+            # name the artifact was really loaded under. The prompt text below
+            # keeps the model's own wording, as the other ADK languages do.
+            if self._process_artifact is not None:
+              try:
+                artifact_part = self._process_artifact(artifact, artifact_name)
+                if inspect.isawaitable(artifact_part):
+                  artifact_part = await artifact_part
+              except Exception:  # pylint: disable=broad-exception-caught
+                logger.exception(
+                    'Failed to process artifact "%s", skipping.', artifact_name
+                )
+                continue
+            else:
+              # The model's own wording, because this name is interpolated into
+              # placeholder text the model reads. The suffix heuristics inside
+              # are unaffected by the prefix.
+              artifact_part = as_safe_part_for_llm(
+                  artifact, requested_name, self._enable_spreadsheet_parsing
+              )
+
+            if artifact_part is None:
+              continue
+            if artifact_part is not artifact:
+              mime_type = (
+                  artifact.inline_data.mime_type
+                  if artifact.inline_data
+                  else None
+              )
+              logger.debug(
+                  'Transformed artifact "%s" (mime_type=%s) to Part',
+                  artifact_name,
+                  mime_type,
+              )
+
+            llm_request.contents.append(
+                types.Content(
+                    role='user',
+                    parts=[
+                        types.Part.from_text(
+                            text=f'Artifact {requested_name} is:'
+                        ),
+                        artifact_part,
+                    ],
+                )
+            )
 
 
 load_artifacts_tool = LoadArtifactsTool()
